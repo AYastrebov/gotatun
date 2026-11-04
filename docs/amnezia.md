@@ -12,7 +12,9 @@ This document covers the two obfuscation features added on top of GotaTun, both 
   refuses to build with both.
 
 With both features off, upstream code paths compile unchanged. With `amnezia` compiled in but no
-config set, the device is plain WireGuard and skips all Amnezia work on the hot path.
+config set, the device is plain WireGuard and skips all Amnezia work on the hot path. One fix
+applies to plain WireGuard too once `amnezia` is compiled in: the handshake timestamp epoch (see
+[Fixes made while porting](#fixes-made-while-porting)).
 
 ## AmneziaWG
 
@@ -156,8 +158,7 @@ Deliberate, with no interop impact:
 * **Floors.** A drawn `max_handshake_attempts` of 0 becomes 1, and a drawn persistent keepalive
   of 0 becomes 1 s. A `0` in a timing key means "WireGuard default".
 * **Retransmit jitter** stays at GotaTun's 0-333 ms, not Go's `[0, 334)`.
-* **Content padding** is not aligned to 16 bytes. Persistent-keepalive re-arming and per-tunnel
-  timing ranges follow GotaTun's timers.
+* **Persistent-keepalive re-arming and per-tunnel timing ranges** follow GotaTun's timers.
 * **`persistent_keepalive_interval`** ranges are wired from `Peer::keepalive_range`.
 
 Where Go behaviour was copied even though it looks odd:
@@ -169,12 +170,22 @@ Where Go behaviour was copied even though it looks odd:
   the fixed window 500, even when the peer is known (Go's `randomTrailer`), so a cookie trailer
   is drawn from at most 500 bytes.
 * `disable_cookies` gates the whole under-load path.
+* With content padding or random trailers on, the drawn padding replaces WireGuard's 16-byte
+  alignment instead of adding to it, so transport payloads are not 16-byte aligned. Go does the
+  same (`RoutineEncryption` only pads to 16 when neither is on).
+* Zero values set through the Rust API are read the way the UAPI reads them: an all-zero
+  `header_protection_key` and a `0` content padding range mean off, a `0` timing range means
+  "WireGuard default", and an empty `I` chain is unset.
 
 ### Fixes made while porting
 
 * **Handshake TAI64N epoch.** GotaTun used `2^62 + 37`; the kernel and Go use `2^62 + 10`, so the
-  timestamp ran 27 s ahead. The fix is enabled only with the `amnezia` feature, so plain upstream
-  behaviour is unchanged when it is off. (This is an upstream bug, to be reported to Mullvad.)
+  timestamp ran 27 s ahead. The fix is a compile-time switch on the `amnezia` feature, not on
+  the config: with `amnezia` compiled in (the `gotatun-cli` default, and shoes), it applies to
+  plain WireGuard tunnels as well. Builds without the feature keep the old epoch. After an
+  upgrade, a peer that has already seen the old, 27 s-ahead stamps from this key rejects the new
+  initiations as replays until the clock catches up, for up to 27 s. (This is an upstream bug,
+  to be reported to Mullvad.)
 * **Mock UDP channel** (tests): the IPv6 flow label could overflow 20 bits (commit `daa7bf9`).
 * **awgtun** (the boringtun fork this port was checked against) had two bugs that are not carried
   over: on its device path, cookie replies lacked the 3.1 trailer (here every cookie reply is
@@ -212,11 +223,17 @@ UAPI surface.
 ### Behaviour
 
 * A Phobos server drops everything except a handshake initiation from an address that has not
-  completed one. After a rebind, the first datagram sent on the new socket is therefore an
-  initiation: other traffic is held back until one has been sent (a per-socket generation gate),
-  and the transport asks the device for the initiation through the `PhobosHandle`.
+  completed one. After a rebind, nothing but an initiation leaves the new socket until one has
+  been sent (a per-socket generation gate), and the transport asks the device for the initiation
+  through the `PhobosHandle`. Under `Stun` and `Media` every initiation is preceded by a STUN
+  Binding Request, so the first datagram on a new socket is that request, then the initiation.
+  With `None` the first datagram is the initiation.
+* The first bind counts as a rebind: the device sends an initiation to every peer with an
+  endpoint as soon as the socket is up, even with no traffic to send.
 * The periodic STUN Binding Request (every 10 s for `Stun`, 5 s for `Media`) is sent by a small
-  task, and the server's Binding Request is answered with a 40-byte Binding Success.
+  task. A Binding Request from the server (the address the transport last sent to) is answered
+  with a 40-byte Binding Success; one from any other address is dropped, so the client is not a
+  STUN reflector.
 
 ### Embedder duty: `address_changed()`
 
@@ -239,6 +256,30 @@ random tail added to cookie and transport messages (`max-dummy`) is only added w
 under 1024 bytes, so large packets are not padded further (the same 1024 cap bounds the dummy tail
 of handshake messages). With `Stun` the framed message may not
 exceed `Masking::max_message_len()`.
+
+## Rebasing on upstream
+
+New code lives in new files (`amnezia/`, `phobos/`, `device/amnezia.rs`, `device/tests/`, the
+`*_amnezia_tests.rs` test files and `noise/tests/amnezia.rs`), and most edits to upstream files
+are added, cfg-gated lines. These upstream edits are not purely additive and are where a rebase
+is most likely to conflict:
+
+* `device/mod.rs`: the send path's `#[cfg(not(feature = "daita"))]` became
+  `#[cfg(not(any(feature = "daita", feature = "amnezia")))]`, and the timer loop's
+  `match p.update_timers()` became `match timers` (Phobos may force an initiation instead).
+* `noise/mod.rs`: on the send path, `if !packet.is_keepalive()` became a local `is_keepalive`
+  decided before Amnezia padding (a padded keepalive is no longer empty); upstream's `mod tests`
+  ends with two lines declaring the Amnezia tests.
+* `noise/timers.rs`: the `REJECT_AFTER_TIME`, `REKEY_ATTEMPT_TIME` and
+  `REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT` constants in `update_timers` and
+  `update_session_timers` became per-tunnel methods (`reject_after_time()`,
+  `rekey_attempt_time()`, `rekey_after_receive()`).
+* `device/configure.rs` (`DeviceRead::peers`) and `device/uapi/mod.rs` (peer update): the
+  `danger_timer_params` field is split into `cfg(feature = "amnezia")` and
+  `cfg(not(feature = "amnezia"))` variants.
+* `device/tests/mock.rs`: `device_pair` is re-indented around a builder hook
+  (`device_pair_with`).
+* `udp/channel.rs`: the mock channel's flow-label fix is active with the features off too.
 
 ## Throughput
 
