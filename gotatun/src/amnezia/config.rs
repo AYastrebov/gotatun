@@ -468,6 +468,40 @@ impl AmneziaConfig {
         Ok(())
     }
 
+    /// Read zero values the way the UAPI and amneziawg-go do: an all-zero
+    /// header protection key and a `0` content padding range mean "off", a `0`
+    /// timing range means "use the default", and an empty I-packet chain is
+    /// unset. The Rust API would otherwise take them literally.
+    pub(crate) fn normalized(mut self) -> Self {
+        fn zero_secs(r: &mut Option<RangeInclusive<Duration>>) {
+            if r.as_ref()
+                .is_some_and(|r| r.start().is_zero() && r.end().is_zero())
+            {
+                *r = None;
+            }
+        }
+        if self.header_protection_key == Some([0; HEADER_PROTECTION_KEY_SIZE]) {
+            self.header_protection_key = None;
+        }
+        if self.content_padding == Some(U32Range::default()) {
+            self.content_padding = None;
+        }
+        let t = &mut self.timings;
+        zero_secs(&mut t.rekey_after_time);
+        zero_secs(&mut t.rekey_timeout);
+        zero_secs(&mut t.reject_after_time);
+        zero_secs(&mut t.keepalive_timeout);
+        if t.max_handshake_attempts == Some(0..=0) {
+            t.max_handshake_attempts = None;
+        }
+        for chain in &mut self.init_packets.0 {
+            if chain.as_ref().is_some_and(CpsChain::is_empty) {
+                *chain = None;
+            }
+        }
+        self
+    }
+
     /// Whether this configuration is indistinguishable from plain WireGuard.
     pub fn is_plain_wireguard(&self) -> bool {
         *self == AmneziaConfig::default()
@@ -796,5 +830,18 @@ mod tests {
         assert!(set(&[("s1", "0x10")]).is_err());
         assert!(set(&[("h1", "5-3")]).is_err());
         assert!(set(&[("header_protection_key", "abcd")]).is_err());
+    }
+
+    #[test]
+    fn normalized_keeps_non_zero_values() {
+        let secs = |a, b| Some(Duration::from_secs(a)..=Duration::from_secs(b));
+        let mut cfg = AmneziaConfig {
+            header_protection_key: Some([1; HEADER_PROTECTION_KEY_SIZE]),
+            content_padding: Some(U32Range { lo: 0, hi: 4 }),
+            ..Default::default()
+        };
+        cfg.timings.rekey_timeout = secs(0, 5);
+        cfg.timings.max_handshake_attempts = Some(0..=3);
+        assert_eq!(cfg.clone().normalized(), cfg);
     }
 }
