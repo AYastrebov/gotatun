@@ -46,12 +46,14 @@ Device keys (in `set`, before the first `public_key`):
 * `i1` .. `i5`: Custom signature packets sent before a handshake, written as a chain of tags, e.g.
   `<b 0xc0ffee><r 24><t>`. An empty value clears the packet.
 * `header_protection_key`: 32-byte key as 64 hex characters that enables header protection. When set,
-  `s1` .. `s4` must each be at least 12.
+  `s1` .. `s4` must each be at least 12. All zeros means off, as in amneziawg-go.
 * `content_padding_addition`: Range `lo-hi` of random bytes added to the content of data packets.
 * `rekey_after_time`, `rekey_timeout`, `reject_after_time`, `keepalive_timeout`: Timer deadlines
   as a number or a range `lo-hi` in seconds, drawn at random from the range.
 * `max_handshake_attempts`: Number or range `lo-hi` of handshake retransmits before giving up.
-* `random_trailers`, `disable_cookies`: `true` or `false`.
+* `random_trailers`, `disable_cookies`: booleans; `set` accepts `1`/`0`, `true`/`false`,
+  `t`/`f` and `on`/`off` in any case, and `get` prints `1` for an enabled flag and nothing for a
+  disabled one.
 
 Peer keys:
 

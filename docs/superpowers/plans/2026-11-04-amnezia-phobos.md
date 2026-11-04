@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-04-amnezia-phobos-design.md`. Read it before any task.
 
+**Status:** executed 2026-11-04 on `feat/amnezia-phobos`. The spec's "Implementation notes" record where the build departed from this plan (zero-copy headroom dropped, window widening on send and receive, receive-side handshake recovery, in-place `set_amnezia`, `PhobosHandle::address_changed`, `tunn_benches` replacing `throughput_benches` as the cost gate).
+
 **References (read-only, never modify):** `~/VibeCode/awgtun` (behaviour plus the tests to port), `~/VibeCode/amneziawg-go` (wire-format authority), https://github.com/Ground-Zerro/Phobos (behaviour authority; (A)GPL, so never copy its code).
 
 ## Global Constraints
@@ -75,24 +77,24 @@
   - Ranges are written `a` or `a-b`.
 - `persistent_keepalive_interval` is **not** here; it is a peer key (Task 10).
 
-- [ ] **Step 1: Port the config tests**
+- [x] **Step 1: Port the config tests**
 
 Port the config, validation and round-trip tests from awgtun's `amnezia.rs` test module into `amnezia/config.rs`. Rename types to match the new names. They must include:
 `h_ranges_must_not_overlap`, `h_values_1_to_4_allowed`, `jmin_gt_jmax_rejected_only_when_jc_positive`, `header_protection_requires_s_ge_12`, `s_values_above_255_accepted` (s1 = 1000), `awg1_keys_rejected` (`j1`, `itime` give an error), `i_packet_gaps_allowed` (only `i3` set is valid), `uapi_round_trip` (parse → `to_uapi_lines` → parse is equal), `default_emits_nothing`, `zero_hp_key_means_off`, `full_u32_h_range_ok` (`0-4294967295` for h4 alone is valid).
 
-- [ ] **Step 2: Confirm the tests fail to compile**
+- [x] **Step 2: Confirm the tests fail to compile**
 
 Run: `ct --features amnezia amnezia::config`. Expected: compile errors, because the types do not exist yet.
 
-- [ ] **Step 3: Implement the types**
+- [x] **Step 3: Implement the types**
 
 Implement the types in `amnezia/config.rs`, porting awgtun's parsing and validation and fitting them to the interfaces above. `CpsChain` parsing lives in Task 2. For now `i1..i5` store the raw string, and Task 2 replaces that with the parsed type.
 
-- [ ] **Step 4: Confirm the tests pass**
+- [x] **Step 4: Confirm the tests pass**
 
 Run: `ct --features amnezia amnezia::config`. Expected: all pass.
 
-- [ ] **Step 5: Run the gates, then commit**
+- [x] **Step 5: Run the gates, then commit**
 
 Run the clippy and powerset gates, then commit with the message `amnezia: config types, validation and UAPI key parsing`.
 
@@ -111,7 +113,7 @@ Run the clippy and powerset gates, then commit with the message `amnezia: config
 - `HeaderProtection::new(key: [u8; 32])`, `fn mask(&self, nonce12: &[u8; 12]) -> [u8; 148]` (ChaCha20, block counter 0), and `fn apply(&self, prefix: &[u8], msg: &mut [u8], protected_len: usize)`. Protected spans: init 148, response 92, cookie 64, transport 16.
 - `pub(crate) fn random_trailer_len(rng, window: usize, size: usize) -> usize`: uniform in half-open `[0, window - size)`, and 0 if `size >= window`.
 
-- [ ] **Step 1: Port the tests**
+- [x] **Step 1: Port the tests**
 
 Port awgtun's tests for these items. They must include:
 - `cps_tags_parse_and_render_lengths`
@@ -121,15 +123,15 @@ Port awgtun's tests for these items. They must include:
 - `trailer_len_half_open`
 - `fast_random_regenerates_after_fork` (unix only)
 
-- [ ] **Step 2: Confirm the tests fail**
+- [x] **Step 2: Confirm the tests fail**
 
 Run: `ct --features amnezia amnezia::`. Expected: FAIL.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Implement, and switch `AmneziaConfig.init_packets` to `CpsChain`.
 
-- [ ] **Step 4: Confirm the tests pass, then commit**
+- [x] **Step 4: Confirm the tests pass, then commit**
 
 Run: `ct --features amnezia amnezia::`. Expected: PASS. Commit with the message `amnezia: RNG, CPS chains, junk, header protection`.
 
@@ -153,7 +155,7 @@ Run: `ct --features amnezia amnezia::`. Expected: PASS. Commit with the message 
   - With `random_trailers`, try transport **first**, and relax the handshake checks to `>=`.
   - Header protection derives the 16-byte mask once per candidate from `prefix[0..12]`.
 
-- [ ] **Step 1: Write the tests**
+- [x] **Step 1: Write the tests**
 
 Write these tests in `classify.rs`:
 - `open_plain_cfg_is_identity`
@@ -166,11 +168,11 @@ Write these tests in `classify.rs`:
 
 Build the input packets with a test-only helper `seal_for_test(cfg, kind, msg) -> Vec<u8>` defined in this file. Task 6 later replaces it with `Obfuscator`, and these tests are then re-pointed at the real sender.
 
-- [ ] **Step 2: Confirm the tests fail, implement, confirm they pass**
+- [x] **Step 2: Confirm the tests fail, implement, confirm they pass**
 
 Run `ct --features amnezia amnezia::classify` before and after implementing. Expected: FAIL first, then PASS.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 Commit with the message `amnezia: receive-side classifier`.
 
@@ -189,18 +191,18 @@ Commit with the message `amnezia: receive-side classifier`.
 
 **Interfaces:** Tasks 3 and 9 use these as `deobfuscator.open(p)` → `rate_limiter.verify_classified(addr, p, kind, cfg.disable_cookies)`.
 
-- [ ] **Step 1: Write the tests**
+- [x] **Step 1: Write the tests**
 
 Write these tests in `rate_limiter.rs`:
 - `verify_classified_accepts_mac_over_h_value`: build an init, set the wire type to 123456 *before* the MACs (recompute them with a test helper), and verify it with kind `HandshakeInit`. Expect `Ok`, and the type byte back to `1`.
 - `verify_classified_rejects_mac_mismatch_after_retype`: the MACs were computed over type 1 but the wire carries H. Expect `Err(InvalidMac)`.
 - `disable_cookies_skips_mac2_under_load`
 
-- [ ] **Step 2: Confirm fail, implement, confirm pass**
+- [x] **Step 2: Confirm fail, implement, confirm pass**
 
 Run `ct --features amnezia rate_limiter`: FAIL before, then PASS. Also run `ct` with no features, which must pass unchanged.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 Commit with the message `amnezia: wire-type hooks and classified MAC verification`.
 
@@ -215,18 +217,18 @@ Commit with the message `amnezia: wire-type hooks and classified MAC verificatio
   - `pub(crate) struct WireTypes { ranges: HeaderRanges }` with `fn init(&self) -> u32` and `fn resp(&self) -> u32`, each drawing from its range with `FastRandom`;
   - `pub(crate) struct AmneziaTunnState { cfg: Arc<AmneziaConfig>, udp_window: usize /* starts at 500 */, mtu: ... }`.
 
-- [ ] **Step 1: Write the tests**
+- [x] **Step 1: Write the tests**
 
 Write these tests in the `noise/mod.rs` test module, using two `Tunn`s that share one config and both pass through the Task 3 + Task 4 receive path:
 - `awg_handshake_completes_with_h_ranges`
 - `init_type_field_in_h1_range`
 - `plain_tunn_rejects_awg_init` (negative control)
 
-- [ ] **Step 2: Check the handshake timestamp epoch**
+- [x] **Step 2: Check the handshake timestamp epoch**
 
 Check that gotatun's TAI64N base matches kernel WireGuard, as awgtun's fix at `handshake.rs:191` (0.12.0, Unix + 10) does. If it differs, add `timestamp_epoch_matches_kernel` and fix it in its own commit. If it already matches, note that in the commit message.
 
-- [ ] **Step 3: Confirm fail, implement, confirm pass, commit**
+- [x] **Step 3: Confirm fail, implement, confirm pass, commit**
 
 Run `ct --features amnezia noise::`: FAIL before, then PASS. Commit with the message `amnezia: H1/H2 chosen before MACs`.
 
@@ -254,7 +256,7 @@ Run `ct --features amnezia noise::`: FAIL before, then PASS. Commit with the mes
 - `SealError::TooLarge` when the datagram would exceed 65535.
 - Re-point Task 3's tests to use `seal` instead of `seal_for_test`, then delete `seal_for_test`.
 
-- [ ] **Step 1: Write the tests**
+- [x] **Step 1: Write the tests**
 
 Write these tests in `seal.rs`:
 - `seal_then_open_round_trips_every_kind` (combinations of trailers on/off and header protection on/off)
@@ -265,7 +267,7 @@ Write these tests in `seal.rs`:
 - `seal_refuses_oversized_datagram` (s1 = 65535)
 - `go_keystream_differential` (port `awg3_wire_format_matches_go_keystream_sequence`)
 
-- [ ] **Step 2: Confirm fail, implement, confirm pass, commit**
+- [x] **Step 2: Confirm fail, implement, confirm pass, commit**
 
 Run `ct --features amnezia amnezia::`: FAIL before, then PASS. Commit with the message `amnezia: send-side obfuscator`.
 
@@ -276,7 +278,7 @@ Run `ct --features amnezia amnezia::`: FAIL before, then PASS. Commit with the m
 - Modify: `gotatun/src/noise/mod.rs` receive. A decrypted payload whose first byte is 0 is a keepalive. A non-IP payload still counts as data received.
 - The window is observed on send (in `seal`) and on receive (Task 9), starts at 500, and is reset on endpoint change.
 
-- [ ] **Step 1: Write the tests**
+- [x] **Step 1: Write the tests**
 
 Write these tests:
 - `content_padding_bounded_by_window_mtu_buffer`
@@ -285,11 +287,11 @@ Write these tests:
 - `padded_keepalive_detected_by_zero_byte`
 - `trailers_widen_transport_padding_only_when_unset`
 
-- [ ] **Step 2: Confirm fail, implement, confirm pass**
+- [x] **Step 2: Confirm fail, implement, confirm pass**
 
 Run `ct --features amnezia`: FAIL before, then PASS. Also run `ct` with no features: PASS.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 Commit with the message `amnezia: content padding and UDP window`.
 
@@ -309,7 +311,7 @@ Commit with the message `amnezia: content padding and UDP window`.
 
   Unset ranges fall back to the defaults.
 
-- [ ] **Step 1: Write the tests**
+- [x] **Step 1: Write the tests**
 
 Write these tests in `timers.rs` (`mock_instant` tests are gated the same way as the existing ones):
 - `max_attempts_bounds_retries`
@@ -317,7 +319,7 @@ Write these tests in `timers.rs` (`mock_instant` tests are gated the same way as
 - `persistent_keepalive_range_redrawn`
 - `unset_ranges_equal_upstream_defaults`
 
-- [ ] **Step 2: Confirm fail, implement, confirm pass, commit**
+- [x] **Step 2: Confirm fail, implement, confirm pass, commit**
 
 Run `ct --features amnezia,mock_instant timers`: FAIL before, then PASS. Commit with the message `amnezia: timing ranges`.
 
@@ -340,7 +342,7 @@ Run `ct --features amnezia,mock_instant timers`: FAIL before, then PASS. Commit 
 - Modify: `gotatun/src/device/configure.rs`. Add `DeviceWrite::set_amnezia(&mut self, cfg: Option<AmneziaConfig>) -> Result<(), ConfigError>` and `DeviceRead::amnezia(&self) -> Option<AmneziaConfig>`. A set validates the config, swaps it, and rebuilds every peer's `Tunn` while keeping keys, endpoints and per-peer timer params.
 - Modify: `gotatun/src/device/tests/mock.rs`. Add `pub async fn device_pair_with(f: impl Fn(DeviceBuilder<..>) -> DeviceBuilder<..>) -> (MockDevice, MockDevice, MockEavesdropper)`. The existing `device_pair()` becomes `device_pair_with(|b| b)`.
 
-- [ ] **Step 1: Write the tests**
+- [x] **Step 1: Write the tests**
 
 Write these tests in `device/tests.rs`, using a synthetic config with every key populated:
 - `awg20_ping_both_directions`
@@ -354,11 +356,11 @@ Write these tests in `device/tests.rs`, using a synthetic config with every key 
 - `uapi_set_amnezia_mid_traffic_rehandshakes` (uses `DeviceWrite::set_amnezia` here; Task 10 adds the UAPI variant)
 - `danger_timer_params_survive_set_amnezia`
 
-- [ ] **Step 2: Confirm fail, implement, confirm pass**
+- [x] **Step 2: Confirm fail, implement, confirm pass**
 
 Run `ct --features amnezia,device device::tests`: FAIL before, then PASS. Also run `ct --features device` (no amnezia): PASS.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 Commit with the message `amnezia: device send/receive boundaries and config API`.
 
@@ -374,7 +376,7 @@ Commit with the message `amnezia: device send/receive boundaries and config API`
 - Modify: `gotatun-cli/Cargo.toml`. Add an `amnezia` feature that is forwarded to the library and enabled by default for the CLI.
 - Modify: `UAPI.md` (document every key, with the amneziawg-go names), `README.md` (a "UAPI extensions" line).
 
-- [ ] **Step 1: Write the tests**
+- [x] **Step 1: Write the tests**
 
 Write these tests in `device/uapi/mod.rs`:
 - `uapi_amnezia_set_get_round_trip`
@@ -383,11 +385,11 @@ Write these tests in `device/uapi/mod.rs`:
 - `uapi_peer_keepalive_range`
 - `uapi_awg1_key_errors`
 
-- [ ] **Step 2: Confirm fail, implement, confirm pass**
+- [x] **Step 2: Confirm fail, implement, confirm pass**
 
 Run `ct --features amnezia,device uapi`: FAIL before, then PASS.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 Commit with the message `amnezia: UAPI keys and docs`.
 
@@ -411,11 +413,11 @@ Commit with the message `amnezia: UAPI keys and docs`.
   - `unwrap<'a>(&mut self, buf: &'a mut [u8], from: SocketAddr) -> Unwrapped<'a>`
   - `binding_request()`, `control_interval()`, `max_message_len()`
 
-- [ ] **Step 1: Port the tests and run them**
+- [x] **Step 1: Port the tests and run them**
 
 Port all 32 awgtun tests, which include the reference conformance vectors. Run `ct --features phobos phobos::`: expect FAIL, then implement, then expect PASS.
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 Commit with the message `phobos: client codec`.
 
@@ -436,7 +438,7 @@ Commit with the message `phobos: client codec`.
   - `build()` errors when both Amnezia and Phobos are configured.
 - Modify: `gotatun/src/device/mod.rs` `handle_timers` (`:610-664`). When the handle reports `take_initiation_request()`, force an initiation for every peer, through the Task 9 `send_wg` path.
 
-- [ ] **Step 1: Write the tests**
+- [x] **Step 1: Write the tests**
 
 Write these tests in `phobos/transport.rs` and `device/tests.rs`:
 - `phobos_ping_through_reference_vectors_peer`: a test peer decodes with `PhobosCodec` server-side logic, written in the test from the spec.
@@ -444,7 +446,7 @@ Write these tests in `phobos/transport.rs` and `device/tests.rs`:
 - `binding_request_stops_after_180s_without_handshake` (`mock_instant`)
 - `amnezia_plus_phobos_build_errors`
 
-- [ ] **Step 2: Confirm fail, implement, confirm pass, commit**
+- [x] **Step 2: Confirm fail, implement, confirm pass, commit**
 
 Run `ct --features phobos,device,amnezia`: FAIL before, then PASS. Commit with the message `phobos: UDP transport wrapper and rebind handling`.
 
@@ -459,11 +461,11 @@ Run `ct --features phobos,device,amnezia`: FAIL before, then PASS. Commit with t
   - the two awgtun bugs fixed here.
 - Modify: `README.md` (feature list), `CHANGELOG.md` (Unreleased entry).
 
-- [ ] **Step 1: Throughput benchmarks**
+- [x] **Step 1: Throughput benchmarks**
 
 Run `cargo bench -p gotatun --bench throughput_benches` twice: with `--features device`, and with `--features device,amnezia` but no config. Expected: the difference is within criterion's noise, under 2%. Record both numbers in the commit message.
 
-- [ ] **Step 2: Full gates**
+- [x] **Step 2: Full gates**
 
 Run:
 - `ct --features amnezia,phobos,device`
@@ -474,10 +476,10 @@ Run:
 
 Expected: all clean.
 
-- [ ] **Step 3: Live-server smoke test (done by the owner)**
+- [x] **Step 3: Live-server smoke test (done by the owner)**
 
 Hand over a `gotatun-cli` command line and a UAPI block template based on `~/VibeCode/awgtun/.claude/skills/amnezia-dev/references/live-server-test.md`.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 Commit with the message `docs: AmneziaWG and Phobos`.
