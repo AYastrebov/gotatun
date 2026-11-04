@@ -169,11 +169,17 @@ impl ReceiveGate {
         let Some(amnezia) = self.amnezia.load() else {
             return self.rate_limiter.verify_packet(src_addr, packet);
         };
-        // With trailers on, a "transport" packet whose receiver index is not
-        // one of ours is read again as a handshake (ruling R14).
+        // With trailers on, an ambiguous datagram is resolved before it is
+        // opened: transport with an unknown receiver index is read as a
+        // handshake (ruling R14), and among several handshake readings the
+        // one whose MAC1 verifies wins (ruling R15).
         let (packet, kind) = amnezia
             .deobfs
-            .open_with(packet, |idx| self.index_table.in_use(idx))
+            .open_with(
+                packet,
+                |idx| self.index_table.in_use(idx),
+                |_, msg| self.rate_limiter.mac1_matches(msg),
+            )
             .ok_or(TunnResult::Err(WireGuardError::InvalidPacket))?;
         self.rate_limiter
             .verify_classified(src_addr, packet, kind, amnezia.cfg.disable_cookies)

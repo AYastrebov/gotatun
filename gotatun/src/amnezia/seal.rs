@@ -410,12 +410,15 @@ mod tests {
     /// Opening a sealed datagram gives back the message, H value included.
     fn assert_opens(cfg: &AmneziaConfig, kind: WgPacketType, msg: &[u8], datagram: &Packet) {
         let deob = Deobfuscator::new(Arc::new(cfg.clone()));
-        // As a device would: only a real transport packet carries a receiver
-        // index it knows, so a handshake misread as transport is read again
-        // (ruling R14; this used to flake at |H4| / 2^32 with OS randomness).
+        // Resolve ambiguity as a device would, with the true kind as oracle:
+        // only a real transport packet carries a receiver index it knows
+        // (R14), and only the true handshake kind's MAC1 verifies (R15). The
+        // result no longer depends on the prefix draw, so tests that seal
+        // with OS randomness (seal_uses_fast_random_by_default) cannot flake
+        // at |H4| / 2^32 or |H1| / 2^32.
         let known_idx = |_| kind == WgPacketType::Data;
         let (opened, got) = deob
-            .open_with(datagram.clone(), known_idx)
+            .open_with(datagram.clone(), known_idx, |k, _| k == kind)
             .expect("datagram classifies");
         assert_eq!(got, kind);
         assert_eq!(&opened[4..], &msg[4..], "{kind:?}: body");

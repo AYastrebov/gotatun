@@ -282,6 +282,21 @@ impl RateLimiter {
         }
     }
 
+    /// Whether MAC1 of a handshake initiation or response `msg` (as on the
+    /// wire, H value included) verifies. MAC1 and MAC2 are its last 32 bytes.
+    ///
+    /// Used only to pick among the readings of an ambiguous AmneziaWG
+    /// datagram (ruling R15); [`RateLimiter::verify_classified`] still checks
+    /// the chosen one.
+    pub(crate) fn mac1_matches(&self, msg: &[u8]) -> bool {
+        let Some(body_len) = msg.len().checked_sub(32) else {
+            return false;
+        };
+        let (body, macs) = msg.split_at(body_len);
+        let computed = b2s_keyed_mac_16(&self.mac1_key, body);
+        constant_time_eq(&computed, &macs[..16])
+    }
+
     /// [`RateLimiter::verify_handshake`], or only the MAC1 check when cookies
     /// are disabled.
     fn verify_classified_handshake<P: WgHandshakeBase>(
@@ -351,6 +366,24 @@ mod amnezia_tests {
         };
         assert_eq!(&p.as_bytes()[..4], &[1, 0, 0, 0]);
         assert_eq!(p.sender_idx.get(), 42);
+    }
+
+    #[test]
+    fn mac1_matches_checks_init_and_response() {
+        let rl = limiter(10);
+        let init = init_with_h(&rl);
+        assert!(rl.mac1_matches(init.as_bytes()));
+        let mut resp = WgHandshakeResp::new(5, 6, [3; 32]);
+        resp.set_wire_type(H_RESP);
+        set_mac1(&rl, &mut resp);
+        assert!(rl.mac1_matches(resp.as_bytes()));
+
+        // The response's bytes read as anything else fail.
+        let mut bytes = resp.as_bytes().to_vec();
+        bytes[8] ^= 1;
+        assert!(!rl.mac1_matches(&bytes));
+        assert!(!rl.mac1_matches(&init.as_bytes()[..WgHandshakeResp::LEN]));
+        assert!(!rl.mac1_matches(&[0; 16]));
     }
 
     #[test]
