@@ -13,6 +13,8 @@
 use super::handshake::{b2s_hash, b2s_keyed_mac_16, b2s_keyed_mac_16_2, b2s_mac_24};
 use crate::noise::handshake::{LABEL_COOKIE, LABEL_MAC1};
 use crate::noise::{TunnResult, WireGuardError};
+#[cfg(feature = "amnezia")]
+use crate::packet::WgPacketType;
 use crate::packet::{Packet, WgCookieReply, WgHandshakeBase, WgKind};
 
 use constant_time_eq::constant_time_eq;
@@ -229,5 +231,222 @@ impl RateLimiter {
         }
 
         Ok(handshake)
+    }
+}
+
+#[cfg(feature = "amnezia")]
+#[allow(dead_code)] // Consumed by later AmneziaWG tasks; only tests use it yet.
+impl RateLimiter {
+    /// Like [`RateLimiter::verify_packet`], for a packet already classified by
+    /// the AmneziaWG deobfuscator as `kind`.
+    ///
+    /// The type field may still carry an H value. MACs are verified over the
+    /// raw bytes as received (H included), matching amneziawg-go. With
+    /// `disable_cookies` the whole under-load path, MAC2 check included, is
+    /// skipped. On success the type field is rewritten to the standard
+    /// 1/2/3/4 so downstream code sees a normal WireGuard packet. An
+    /// under-load cookie reply carries the standard type; the send boundary
+    /// applies H3.
+    pub(crate) fn verify_classified(
+        &self,
+        src_addr: SocketAddr,
+        packet: Packet,
+        kind: WgPacketType,
+        disable_cookies: bool,
+    ) -> Result<WgKind, TunnResult> {
+        let packet = packet
+            .try_into_wg_as(kind)
+            .map_err(|_err| TunnResult::Err(WireGuardError::InvalidPacket))?;
+
+        match packet {
+            WgKind::HandshakeInit(packet) => {
+                let mut packet =
+                    self.verify_classified_handshake(src_addr, packet, disable_cookies)?;
+                packet.set_wire_type(WgPacketType::HandshakeInit.0.into());
+                Ok(WgKind::HandshakeInit(packet))
+            }
+            WgKind::HandshakeResp(packet) => {
+                let mut packet =
+                    self.verify_classified_handshake(src_addr, packet, disable_cookies)?;
+                packet.set_wire_type(WgPacketType::HandshakeResp.0.into());
+                Ok(WgKind::HandshakeResp(packet))
+            }
+            WgKind::CookieReply(mut packet) => {
+                packet.set_wire_type(WgPacketType::CookieReply.0.into());
+                Ok(WgKind::CookieReply(packet))
+            }
+            WgKind::Data(mut packet) => {
+                packet.header.set_wire_type(WgPacketType::Data.0.into());
+                Ok(WgKind::Data(packet))
+            }
+        }
+    }
+
+    /// [`RateLimiter::verify_handshake`], or only the MAC1 check when cookies
+    /// are disabled.
+    fn verify_classified_handshake<P: WgHandshakeBase>(
+        &self,
+        src_addr: SocketAddr,
+        handshake: Packet<P>,
+        disable_cookies: bool,
+    ) -> Result<Packet<P>, TunnResult> {
+        if !disable_cookies {
+            return self.verify_handshake(src_addr, handshake);
+        }
+
+        let computed_mac1 = b2s_keyed_mac_16(&self.mac1_key, handshake.until_mac1());
+        if !constant_time_eq(&computed_mac1, handshake.mac1()) {
+            return Err(TunnResult::Err(WireGuardError::InvalidMac));
+        }
+        Ok(handshake)
+    }
+}
+
+#[cfg(all(test, feature = "amnezia"))]
+mod amnezia_tests {
+    use super::*;
+    use crate::packet::{WgData, WgHandshakeInit, WgHandshakeResp, WgPacketType};
+    use bytes::BytesMut;
+    use zerocopy::IntoBytes;
+
+    /// Synthetic H value, well outside 1..=4.
+    const H_INIT: u32 = 123_456;
+    const H_RESP: u32 = 7_654_321;
+    const H_DATA: u32 = 2_000_000_001;
+
+    fn limiter(limit: u64) -> RateLimiter {
+        let secret = crate::x25519::StaticSecret::from([7u8; 32]);
+        RateLimiter::new(&crate::x25519::PublicKey::from(&secret), limit)
+    }
+
+    fn addr() -> SocketAddr {
+        "192.0.2.1:51820".parse().unwrap()
+    }
+
+    /// Recompute mac1 over the current bytes (including the wire type field).
+    fn set_mac1<P: WgHandshakeBase>(rl: &RateLimiter, hs: &mut P) {
+        let mac1 = b2s_keyed_mac_16(&rl.mac1_key, hs.until_mac1());
+        *hs.mac1_mut() = mac1;
+    }
+
+    fn init_with_h(rl: &RateLimiter) -> WgHandshakeInit {
+        let mut init = WgHandshakeInit::new();
+        init.sender_idx.set(42);
+        init.unencrypted_ephemeral = [9; 32];
+        init.set_wire_type(H_INIT);
+        set_mac1(rl, &mut init);
+        init
+    }
+
+    #[test]
+    fn verify_classified_accepts_mac_over_h_value() {
+        let rl = limiter(10);
+        let init = init_with_h(&rl);
+        assert_eq!(&init.as_bytes()[..4], &H_INIT.to_le_bytes());
+
+        let p = Packet::copy_from(&init).into_bytes();
+        let res = rl.verify_classified(addr(), p, WgPacketType::HandshakeInit, false);
+        let Ok(WgKind::HandshakeInit(p)) = res else {
+            panic!("expected Ok(HandshakeInit), got {res:?}");
+        };
+        assert_eq!(&p.as_bytes()[..4], &[1, 0, 0, 0]);
+        assert_eq!(p.sender_idx.get(), 42);
+    }
+
+    #[test]
+    fn verify_classified_accepts_response_over_h_value() {
+        let rl = limiter(10);
+        let mut resp = WgHandshakeResp::new(5, 6, [3; 32]);
+        resp.set_wire_type(H_RESP);
+        set_mac1(&rl, &mut resp);
+
+        let p = Packet::copy_from(&resp).into_bytes();
+        let res = rl.verify_classified(addr(), p, WgPacketType::HandshakeResp, false);
+        let Ok(WgKind::HandshakeResp(p)) = res else {
+            panic!("expected Ok(HandshakeResp), got {res:?}");
+        };
+        assert_eq!(&p.as_bytes()[..4], &[2, 0, 0, 0]);
+    }
+
+    #[test]
+    fn verify_classified_rejects_mac_mismatch_after_retype() {
+        let rl = limiter(10);
+        let mut init = WgHandshakeInit::new();
+        init.sender_idx.set(42);
+        // MACs computed over the standard type 1 ...
+        set_mac1(&rl, &mut init);
+        // ... but the wire carries H.
+        init.set_wire_type(H_INIT);
+
+        let p = Packet::copy_from(&init).into_bytes();
+        let res = rl.verify_classified(addr(), p, WgPacketType::HandshakeInit, false);
+        assert!(
+            matches!(res, Err(TunnResult::Err(WireGuardError::InvalidMac))),
+            "got {res:?}"
+        );
+    }
+
+    #[test]
+    fn disable_cookies_skips_mac2_under_load() {
+        // limit 0: every handshake counts as under load.
+        let rl = limiter(0);
+
+        // Cookies on: mac2 is missing, so we get a standard-type cookie reply.
+        let p = Packet::copy_from(&init_with_h(&rl)).into_bytes();
+        let res = rl.verify_classified(addr(), p, WgPacketType::HandshakeInit, false);
+        let Err(TunnResult::WriteToNetwork(WgKind::CookieReply(reply))) = res else {
+            panic!("expected cookie reply, got {res:?}");
+        };
+        assert_eq!(&reply.as_bytes()[..4], &[3, 0, 0, 0]);
+        assert_eq!(reply.receiver_idx.get(), 42);
+
+        // Cookies off: the whole under-load path, mac2 included, is skipped.
+        let p = Packet::copy_from(&init_with_h(&rl)).into_bytes();
+        let res = rl.verify_classified(addr(), p, WgPacketType::HandshakeInit, true);
+        let Ok(WgKind::HandshakeInit(p)) = res else {
+            panic!("expected Ok(HandshakeInit), got {res:?}");
+        };
+        assert_eq!(&p.as_bytes()[..4], &[1, 0, 0, 0]);
+
+        // Cookies off still checks mac1.
+        let mut bad = init_with_h(&rl);
+        bad.mac1[0] ^= 1;
+        let p = Packet::copy_from(&bad).into_bytes();
+        let res = rl.verify_classified(addr(), p, WgPacketType::HandshakeInit, true);
+        assert!(
+            matches!(res, Err(TunnResult::Err(WireGuardError::InvalidMac))),
+            "got {res:?}"
+        );
+    }
+
+    #[test]
+    fn verify_classified_retypes_data_and_checks_size() {
+        let rl = limiter(10);
+        let mut bytes = [0xabu8; WgData::OVERHEAD + 32];
+        bytes[..4].copy_from_slice(&H_DATA.to_le_bytes());
+        let p = Packet::from_bytes(BytesMut::from(&bytes[..]));
+        let res = rl.verify_classified(addr(), p, WgPacketType::Data, false);
+        let Ok(WgKind::Data(p)) = res else {
+            panic!("expected Ok(Data), got {res:?}");
+        };
+        assert_eq!(&p.as_bytes()[..4], &[4, 0, 0, 0]);
+        assert_eq!(&p.as_bytes()[4..], &bytes[4..]);
+
+        // Too short for the classified kind.
+        let p = Packet::from_bytes(BytesMut::from(&bytes[..WgData::OVERHEAD - 1]));
+        let res = rl.verify_classified(addr(), p, WgPacketType::Data, false);
+        assert!(
+            matches!(res, Err(TunnResult::Err(WireGuardError::InvalidPacket))),
+            "got {res:?}"
+        );
+
+        // Handshake kind with the wrong length.
+        let short = [0u8; WgHandshakeInit::LEN - 1];
+        let p = Packet::from_bytes(BytesMut::from(&short[..]));
+        let res = rl.verify_classified(addr(), p, WgPacketType::HandshakeInit, false);
+        assert!(
+            matches!(res, Err(TunnResult::Err(WireGuardError::InvalidPacket))),
+            "got {res:?}"
+        );
     }
 }

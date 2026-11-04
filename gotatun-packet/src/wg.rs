@@ -259,6 +259,18 @@ impl Default for WgDataHeader {
     }
 }
 
+#[cfg(feature = "amnezia")]
+#[allow(dead_code)] // Consumed by later AmneziaWG tasks; only tests use it yet.
+impl WgDataHeader {
+    /// Overwrite the 4-byte little-endian type field (`packet_type` plus the
+    /// reserved bytes) with `v`. AmneziaWG carries its H values here.
+    pub(crate) fn set_wire_type(&mut self, v: u32) {
+        let [t, r0, r1, r2] = v.to_le_bytes();
+        self.packet_type = WgPacketType(t);
+        self._reserved_zeros = [r0, r1, r2];
+    }
+}
+
 impl Deref for WgDataAndTag {
     type Target = [u8];
 
@@ -389,6 +401,18 @@ impl Default for WgHandshakeInit {
     }
 }
 
+#[cfg(feature = "amnezia")]
+#[allow(dead_code)] // Consumed by later AmneziaWG tasks; only tests use it yet.
+impl WgHandshakeInit {
+    /// Overwrite the 4-byte little-endian type field (`packet_type` plus the
+    /// reserved bytes) with `v`. AmneziaWG carries its H values here.
+    pub(crate) fn set_wire_type(&mut self, v: u32) {
+        let [t, r0, r1, r2] = v.to_le_bytes();
+        self.packet_type = WgPacketType(t);
+        self._reserved_zeros = [r0, r1, r2];
+    }
+}
+
 /// WireGuard handshake response packet.
 /// See section 5.4.3 of the [whitepaper](https://www.wireguard.com/papers/wireguard.pdf).
 #[derive(FromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
@@ -462,6 +486,18 @@ impl WgHandshakeBase for WgHandshakeResp {
     }
 }
 
+#[cfg(feature = "amnezia")]
+#[allow(dead_code)] // Consumed by later AmneziaWG tasks; only tests use it yet.
+impl WgHandshakeResp {
+    /// Overwrite the 4-byte little-endian type field (`packet_type` plus the
+    /// reserved bytes) with `v`. AmneziaWG carries its H values here.
+    pub(crate) fn set_wire_type(&mut self, v: u32) {
+        let [t, r0, r1, r2] = v.to_le_bytes();
+        self.packet_type = WgPacketType(t);
+        self._reserved_zeros = [r0, r1, r2];
+    }
+}
+
 /// WireGuard cookie reply packet.
 /// See section 5.4.7 of the [whitepaper](https://www.wireguard.com/papers/wireguard.pdf).
 #[derive(FromBytes, IntoBytes, KnownLayout, Unaligned, Immutable)]
@@ -501,6 +537,18 @@ impl Default for WgCookieReply {
     }
 }
 
+#[cfg(feature = "amnezia")]
+#[allow(dead_code)] // Consumed by later AmneziaWG tasks; only tests use it yet.
+impl WgCookieReply {
+    /// Overwrite the 4-byte little-endian type field (`packet_type` plus the
+    /// reserved bytes) with `v`. AmneziaWG carries its H values here.
+    pub(crate) fn set_wire_type(&mut self, v: u32) {
+        let [t, r0, r1, r2] = v.to_le_bytes();
+        self.packet_type = WgPacketType(t);
+        self._reserved_zeros = [r0, r1, r2];
+    }
+}
+
 impl Packet {
     /// Try to cast to a WireGuard packet while sanity-checking packet type and size.
     pub fn try_into_wg(self) -> eyre::Result<WgKind> {
@@ -509,6 +557,31 @@ impl Packet {
 
         let len = wg.as_bytes().len();
         match (wg.packet_type, len) {
+            (WgPacketType::HandshakeInit, WgHandshakeInit::LEN) => {
+                Ok(WgKind::HandshakeInit(self.cast()))
+            }
+            (WgPacketType::HandshakeResp, WgHandshakeResp::LEN) => {
+                Ok(WgKind::HandshakeResp(self.cast()))
+            }
+            (WgPacketType::CookieReply, WgCookieReply::LEN) => Ok(WgKind::CookieReply(self.cast())),
+            (WgPacketType::Data, WgData::OVERHEAD..) => Ok(WgKind::Data(self.cast())),
+            _ => {
+                bail!("Not a wireguard packet, bad type/size.");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "amnezia")]
+#[allow(dead_code)] // Consumed by later AmneziaWG tasks; only tests use it yet.
+impl Packet {
+    /// Cast to a WireGuard packet of an already classified `kind`.
+    ///
+    /// Applies the same size checks as [`Packet::try_into_wg`] but ignores the
+    /// type field, which may still carry an AmneziaWG H value.
+    pub(crate) fn try_into_wg_as(self, kind: WgPacketType) -> eyre::Result<WgKind> {
+        let len = self.as_bytes().len();
+        match (kind, len) {
             (WgPacketType::HandshakeInit, WgHandshakeInit::LEN) => {
                 Ok(WgKind::HandshakeInit(self.cast()))
             }
