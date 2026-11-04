@@ -62,7 +62,7 @@ pub enum ConfigError {
         /// Why it was rejected.
         reason: &'static str,
     },
-    /// A key has an unparseable value.
+    /// A key has an unparsable value.
     #[error("invalid value for `{field}`: {reason}")]
     InvalidFieldValue {
         /// The key name.
