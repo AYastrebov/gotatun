@@ -1,6 +1,7 @@
 //! Injectable randomness for AmneziaWG packet generation.
 
 use std::cell::RefCell;
+#[cfg(unix)]
 use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -84,8 +85,6 @@ impl FastRngState {
                 }
             });
         }
-        #[cfg(not(unix))]
-        let _ = Once::new;
 
         let mut state = FastRngState {
             key: [0u8; 32],
