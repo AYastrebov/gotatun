@@ -516,7 +516,11 @@ impl<T: DeviceTransports> DeviceState<T> {
         );
 
         #[cfg(feature = "amnezia")]
-        self.amnezia_setup_tunn(&mut tunn, peer_builder.danger_timer_params.as_ref());
+        self.amnezia_setup_tunn(
+            &mut tunn,
+            peer_builder.danger_timer_params.as_ref(),
+            peer_builder.keepalive_range.as_ref(),
+        );
         #[cfg(feature = "amnezia")]
         let danger_timer_params = peer_builder.danger_timer_params.clone();
 
@@ -532,6 +536,8 @@ impl<T: DeviceTransports> DeviceState<T> {
             peer_builder.daita_settings,
             #[cfg(feature = "amnezia")]
             danger_timer_params,
+            #[cfg(feature = "amnezia")]
+            peer_builder.keepalive_range,
         )
     }
 

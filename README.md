@@ -78,7 +78,8 @@ The behaviour is similar to that of [wireguard-go](https://git.zx2c4.com/wiregua
 
 ## UAPI extensions
 
-See [UAPI](./UAPI.md) for extensions to the `wg` configuration protocol.
+See [UAPI](./UAPI.md) for extensions to the `wg` configuration protocol, including the
+AmneziaWG keys (`--features amnezia`, on by default for `gotatun-cli`).
 
 ---
 

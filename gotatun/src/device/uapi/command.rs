@@ -93,6 +93,12 @@ pub struct GetPeer {
     /// Total bytes of decoy packets received from the previously added peer.
     #[builder(default, setter(strip_option, into))]
     pub rx_decoy_packet_bytes: Option<u64>,
+
+    /// The AmneziaWG persistent keepalive range (`a-b`) of the peer, shown instead of
+    /// [`Peer::persistent_keepalive_interval`] when set.
+    #[cfg(feature = "amnezia")]
+    #[builder(default, setter(strip_option, into))]
+    pub persistent_keepalive_range: Option<std::ops::RangeInclusive<u16>>,
 }
 
 /// Response containing the current device configuration.
@@ -110,6 +116,11 @@ pub struct GetResponse {
     /// The fwmark of the interface.
     #[builder(default, setter(strip_option, into))]
     pub fwmark: Option<u32>,
+
+    /// The AmneziaWG settings that differ from the defaults, as `(key, value)` lines.
+    #[cfg(feature = "amnezia")]
+    #[builder(default)]
+    pub amnezia: Vec<(String, String)>,
 
     /// List of peers and their statistics.
     #[builder(default, setter(skip))]
@@ -147,6 +158,11 @@ pub struct Set {
     #[builder(default, setter(strip_option, into))]
     pub protocol_version: Option<String>,
 
+    /// AmneziaWG `(key, value)` lines, merged into the device's current config.
+    #[cfg(feature = "amnezia")]
+    #[builder(default, setter(strip_option, into))]
+    pub amnezia: Option<Vec<(String, String)>>,
+
     /// List of peers to add or modify.
     #[builder(default, setter(skip))]
     pub peers: Vec<SetPeer>,
@@ -172,6 +188,11 @@ pub struct SetPeer {
     /// allowed IPs list.
     #[builder(setter(strip_bool))]
     pub replace_allowed_ips: bool,
+
+    /// AmneziaWG `persistent_keepalive_interval=a-b`: a range, re-drawn on every keepalive.
+    #[cfg(feature = "amnezia")]
+    #[builder(default, setter(strip_option, into))]
+    pub persistent_keepalive_range: Option<std::ops::RangeInclusive<u16>>,
 }
 
 /// Response indicating the result of a set operation.
@@ -276,6 +297,8 @@ impl SetPeer {
             remove: false,
             update_only: false,
             replace_allowed_ips: false,
+            #[cfg(feature = "amnezia")]
+            persistent_keepalive_range: None,
         }
     }
 
@@ -311,6 +334,8 @@ impl GetPeer {
             tx_decoy_packet_bytes: None,
             rx_padding_bytes: None,
             rx_decoy_packet_bytes: None,
+            #[cfg(feature = "amnezia")]
+            persistent_keepalive_range: None,
         }
     }
 }
@@ -352,6 +377,8 @@ impl Display for GetResponse {
             private_key,
             listen_port,
             fwmark,
+            #[cfg(feature = "amnezia")]
+            amnezia,
             peers,
             errno,
         } = self;
@@ -365,6 +392,11 @@ impl Display for GetResponse {
         .flatten();
 
         for (key, value) in fields {
+            writeln!(f, "{key}={value}")?;
+        }
+
+        #[cfg(feature = "amnezia")]
+        for (key, value) in amnezia {
             writeln!(f, "{key}={value}")?;
         }
 
@@ -400,9 +432,18 @@ impl Display for GetPeer {
             tx_decoy_packet_bytes: daita_tx_decoy_packet_bytes,
             rx_padding_bytes: daita_rx_padding_bytes,
             rx_decoy_packet_bytes: daita_rx_decoy_packet_bytes,
+            #[cfg(feature = "amnezia")]
+            persistent_keepalive_range,
         } = self;
 
         let public_key = Some(&public_key);
+
+        // A range is shown in place of the fixed interval.
+        #[cfg(feature = "amnezia")]
+        let persistent_keepalive_interval: Option<String> = match persistent_keepalive_range {
+            Some(range) => Some(format!("{}-{}", range.start(), range.end())),
+            None => persistent_keepalive_interval.map(|secs| secs.to_string()),
+        };
 
         let fields = [
             opt_to_key_and_display!(public_key),
@@ -557,6 +598,8 @@ impl FromStr for Set {
             fwmark,
             replace_peers,
             protocol_version,
+            #[cfg(feature = "amnezia")]
+            amnezia,
             peers,
         } = &mut set;
 
@@ -590,6 +633,9 @@ impl FromStr for Set {
                     })
                 }
 
+                #[cfg(feature = "amnezia")]
+                _ if try_process_amnezia_line(amnezia, k, v)? => (),
+
                 _ => {
                     bail!("Key {k:?} in {line:?} is not allowed in command set");
                 }
@@ -620,6 +666,8 @@ impl SetPeer {
             remove,
             update_only,
             replace_allowed_ips,
+            #[cfg(feature = "amnezia")]
+            persistent_keepalive_range,
         } = &mut set_peer;
 
         // loop until we peek an empty line or end-of-string
@@ -650,6 +698,15 @@ impl SetPeer {
                     });
                 }
                 "endpoint" => parse_opt!(k, v, endpoint),
+                #[cfg(feature = "amnezia")]
+                "persistent_keepalive_interval" if v.contains('-') => {
+                    ensure!(
+                        persistent_keepalive_range.is_none()
+                            && persistent_keepalive_interval.is_none(),
+                        "Key {k:?} may not be specified twice",
+                    );
+                    *persistent_keepalive_range = Some(parse_keepalive_range(v)?);
+                }
                 "persistent_keepalive_interval" => parse_opt!(k, v, persistent_keepalive_interval),
                 "remove" => parse_bool!(k, v, remove),
                 "update_only" => parse_bool!(k, v, update_only),
@@ -671,6 +728,45 @@ impl SetPeer {
 
         Ok(set_peer)
     }
+}
+
+/// Collect an AmneziaWG key into `amnezia`. If the key is not an AmneziaWG key, `Ok(false)` is
+/// returned. A recognized key with a bad value (or an unsupported AWG 1.x key) is an error.
+///
+/// Only the value's syntax is checked here; the merged config is validated when applied.
+#[cfg(feature = "amnezia")]
+fn try_process_amnezia_line(
+    amnezia: &mut Option<Vec<(String, String)>>,
+    k: &str,
+    v: &str,
+) -> eyre::Result<bool> {
+    let known = crate::amnezia::AmneziaConfig::default()
+        .apply_uapi_line(k, v)
+        .map_err(|err| eyre!("invalid value for {k:?}: {err}"))?;
+    if known {
+        amnezia
+            .get_or_insert_default()
+            .push((k.to_owned(), v.to_owned()));
+    }
+    Ok(known)
+}
+
+/// Parse an AmneziaWG `a-b` keepalive range, in whole seconds.
+#[cfg(feature = "amnezia")]
+fn parse_keepalive_range(v: &str) -> eyre::Result<std::ops::RangeInclusive<u16>> {
+    let parse = |s: &str| {
+        s.parse::<u16>()
+            .map_err(|err| eyre!("invalid persistent_keepalive_interval {v:?}: {err}"))
+    };
+    let (lo, hi) = v
+        .split_once('-')
+        .ok_or_else(|| eyre!("invalid persistent_keepalive_interval {v:?}"))?;
+    let (lo, hi) = (parse(lo)?, parse(hi)?);
+    ensure!(
+        lo <= hi,
+        "invalid persistent_keepalive_interval {v:?}: wrong range specified"
+    );
+    Ok(lo..=hi)
 }
 
 /// Update `daita_settings` based on the key-value pair. If the key is not recognized,
