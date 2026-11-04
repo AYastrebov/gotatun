@@ -27,6 +27,8 @@ mod timers;
 use rand::{RngCore, SeedableRng, rngs::StdRng};
 use zerocopy::IntoBytes;
 
+#[cfg(feature = "amnezia")]
+use crate::amnezia::tunn_state::AmneziaTunnState;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::index_table::IndexTable;
@@ -86,6 +88,10 @@ pub struct Tunn<R: RngCore + Send = StdRng> {
     rate_limiter: Arc<RateLimiter>,
     /// RNG used for handshake retry jitter.
     jitter_rng: R,
+    /// AmneziaWG per-tunnel state; `None` is plain WireGuard.
+    #[cfg(feature = "amnezia")]
+    #[allow(dead_code)] // Read by content padding and the device send path.
+    amnezia: Option<AmneziaTunnState>,
 }
 
 impl Tunn<StdRng> {
@@ -142,6 +148,8 @@ impl<R: RngCore + Send> Tunn<R> {
 
             rate_limiter,
             jitter_rng,
+            #[cfg(feature = "amnezia")]
+            amnezia: None,
         }
     }
 
@@ -528,6 +536,20 @@ fn pad_to_x16(mut packet: Packet, tun_mtu: &mut MtuWatcher) -> Packet {
     packet.buf_mut().resize(padded_packet_len, 0);
 
     packet
+}
+
+#[cfg(feature = "amnezia")]
+impl<R: RngCore + Send> Tunn<R> {
+    /// Turn AmneziaWG obfuscation on (`Some`) or off (`None`) for this tunnel.
+    ///
+    /// Handshakes formatted afterwards carry H1/H2 type values, chosen before
+    /// their MACs are computed.
+    #[allow(dead_code)] // Called by the device when it builds peer tunnels.
+    pub(crate) fn set_amnezia(&mut self, state: Option<AmneziaTunnState>) {
+        self.handshake
+            .set_wire_types(state.as_ref().map(AmneziaTunnState::wire_types));
+        self.amnezia = state;
+    }
 }
 
 #[cfg(test)]
@@ -1265,5 +1287,169 @@ mod tests {
         MockClock::set_time(RESUMED_TIME);
         my_tun.update_timers().unwrap();
         assert_eq!(my_tun.timers[TimerName::TimeCurrent], RESUMED_TIME);
+    }
+
+    #[cfg(feature = "amnezia")]
+    mod amnezia {
+        use super::*;
+        use crate::amnezia::classify::Deobfuscator;
+        use crate::amnezia::rng::{FastRandom, RandomSource};
+        use crate::amnezia::{AmneziaConfig, HeaderRange, HeaderRanges, Padding};
+
+        /// Synthetic AWG parameters with the real shape: S2 > 64, H ranges
+        /// millions wide. No header protection, so the test sender below only
+        /// has to prepend the S-prefix.
+        fn awg_cfg(s1: u16, s2: u16) -> Arc<AmneziaConfig> {
+            Arc::new(AmneziaConfig {
+                headers: HeaderRanges {
+                    init: HeaderRange {
+                        start: 1_300_000,
+                        end: 2_300_000,
+                    },
+                    response: HeaderRange {
+                        start: 3_300_000,
+                        end: 4_300_000,
+                    },
+                    cookie: HeaderRange {
+                        start: 5_300_000,
+                        end: 6_300_000,
+                    },
+                    transport: HeaderRange {
+                        start: 7_300_000,
+                        end: 8_300_000,
+                    },
+                },
+                padding: Padding {
+                    s1,
+                    s2,
+                    s3: 31,
+                    s4: 19,
+                },
+                ..AmneziaConfig::default()
+            })
+        }
+
+        fn awg_tuns(cfg: &Arc<AmneziaConfig>) -> (Tunn, Tunn) {
+            let (mut a, mut b) = create_two_tuns();
+            a.set_amnezia(Some(AmneziaTunnState::new(cfg.clone())));
+            b.set_amnezia(Some(AmneziaTunnState::new(cfg.clone())));
+            (a, b)
+        }
+
+        fn addr() -> SocketAddr {
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 12345)
+        }
+
+        fn wire_type(bytes: &[u8]) -> u32 {
+            u32::from_le_bytes(bytes[..4].try_into().unwrap())
+        }
+
+        /// Test-only sender: prepend a random S-prefix (Task 6 adds the real
+        /// `seal`).
+        fn with_prefix(prefix: u16, msg: &[u8]) -> Packet {
+            let mut out = vec![0u8; usize::from(prefix)];
+            FastRandom.fill(&mut out);
+            out.extend_from_slice(msg);
+            Packet::from_bytes(BytesMut::from(&out[..]))
+        }
+
+        /// The AmneziaWG receive path: classify and open, verify the MACs
+        /// over the raw bytes (H included), then hand the plain message to
+        /// `to`.
+        fn deliver(cfg: &Arc<AmneziaConfig>, to: &mut Tunn, datagram: Packet) -> TunnResult {
+            let (packet, kind) = Deobfuscator::new(cfg.clone())
+                .open(datagram)
+                .expect("datagram classifies");
+            match to
+                .rate_limiter
+                .verify_classified(addr(), packet, kind, cfg.disable_cookies)
+            {
+                Ok(packet) => to.handle_incoming_packet(packet),
+                Err(result) => result,
+            }
+        }
+
+        #[test]
+        fn awg_handshake_completes_with_h_ranges() {
+            let cfg = awg_cfg(23, 87);
+            let (mut a, mut b) = awg_tuns(&cfg);
+
+            let init = create_handshake_init(&mut a);
+            let datagram = with_prefix(cfg.padding.s1, init.as_bytes());
+            let result = deliver(&cfg, &mut b, datagram);
+            let TunnResult::WriteToNetwork(WgKind::HandshakeResp(resp)) = result else {
+                panic!("expected a handshake response, got {result:?}");
+            };
+
+            let h2 = cfg.headers.response;
+            let h = wire_type(resp.as_bytes());
+            assert!(
+                (h2.start..=h2.end).contains(&h),
+                "response type {h} outside H2"
+            );
+
+            let datagram = with_prefix(cfg.padding.s2, resp.as_bytes());
+            let result = deliver(&cfg, &mut a, datagram);
+            let TunnResult::WriteToNetwork(WgKind::Data(keepalive)) = result else {
+                panic!("expected a keepalive after the handshake, got {result:?}");
+            };
+            parse_keepalive(&mut b, keepalive);
+            assert_packet_roundtrip(&mut a, &mut b);
+            assert_packet_roundtrip(&mut b, &mut a);
+        }
+
+        #[test]
+        fn init_type_field_in_h1_range() {
+            let cfg = awg_cfg(23, 87);
+            let (mut a, _b) = awg_tuns(&cfg);
+            let h1 = cfg.headers.init;
+
+            let types: Vec<u32> = (0..64)
+                .map(|_| {
+                    let init = a
+                        .format_handshake_initiation(true)
+                        .expect("expected handshake init");
+                    wire_type(init.as_bytes())
+                })
+                .collect();
+            for h in &types {
+                assert!((h1.start..=h1.end).contains(h), "init type {h} outside H1");
+            }
+            assert!(
+                types.iter().any(|h| *h != types[0]),
+                "H1 is drawn per handshake"
+            );
+        }
+
+        /// Negative control: a plain WireGuard receiver must not take an
+        /// AmneziaWG initiation for a WireGuard one.
+        #[test]
+        fn plain_tunn_rejects_awg_init() {
+            let plain = Arc::new(AmneziaConfig::default());
+            for cfg in [awg_cfg(0, 0), awg_cfg(23, 87)] {
+                let (mut a, _b) = create_two_tuns();
+                a.set_amnezia(Some(AmneziaTunnState::new(cfg.clone())));
+
+                for _ in 0..16 {
+                    let init = a
+                        .format_handshake_initiation(true)
+                        .expect("expected handshake init");
+                    let datagram = with_prefix(cfg.padding.s1, init.as_bytes());
+
+                    // The type field holds H1 rather than 1, and S1 shifts
+                    // the message; the plain classifier recognises neither.
+                    assert!(
+                        Deobfuscator::new(plain.clone())
+                            .open(datagram.clone())
+                            .is_none(),
+                        "plain classifier accepted an AWG init (S1 = {})",
+                        cfg.padding.s1
+                    );
+                    if cfg.padding.s1 > 0 {
+                        assert!(datagram.try_into_wg().is_err());
+                    }
+                }
+            }
+        }
     }
 }

@@ -10,6 +10,8 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
+#[cfg(feature = "amnezia")]
+use crate::amnezia::tunn_state::WireTypes;
 use crate::noise::errors::WireGuardError;
 use crate::noise::index_table::{Index, IndexTable};
 use crate::noise::session::Session;
@@ -324,6 +326,9 @@ pub struct Handshake {
     // TODO: make TimeStamper a singleton
     stamper: TimeStamper,
     pub(super) last_rtt: Option<u32>,
+    /// AmneziaWG H1/H2 drawer; `None` sends the plain types 1 and 2.
+    #[cfg(feature = "amnezia")]
+    wire_types: Option<WireTypes>,
 }
 
 #[derive(Default)]
@@ -465,6 +470,8 @@ impl Handshake {
             stamper: TimeStamper::new(),
             cookies: Default::default(),
             last_rtt: None,
+            #[cfg(feature = "amnezia")]
+            wire_types: None,
         }
     }
 
@@ -835,6 +842,8 @@ impl Handshake {
             }),
         );
 
+        #[cfg(feature = "amnezia")]
+        self.set_init_wire_type(&mut handshake);
         self.init_mac1_and_mac2(&mut handshake, local_index_val);
 
         Packet::copy_from(&handshake)
@@ -919,11 +928,35 @@ impl Handshake {
         let temp2 = b2s_hmac(&temp1, &[0x01]);
         let temp3 = b2s_hmac2(&temp1, &temp2, &[0x02]);
 
+        #[cfg(feature = "amnezia")]
+        self.set_resp_wire_type(&mut resp);
         self.init_mac1_and_mac2(&mut resp, local_index_val);
 
         let packet = buf.overwrite_with(&resp);
 
         (packet, Session::new(local_index, peer_index, temp2, temp3))
+    }
+}
+
+#[cfg(feature = "amnezia")]
+impl Handshake {
+    /// Use `wire_types` for the type field of handshakes formatted from now on.
+    pub(crate) fn set_wire_types(&mut self, wire_types: Option<WireTypes>) {
+        self.wire_types = wire_types;
+    }
+
+    /// Write an H1 value into `packet`; must run before the MACs are computed.
+    fn set_init_wire_type(&self, packet: &mut WgHandshakeInit) {
+        if let Some(wt) = &self.wire_types {
+            packet.set_wire_type(wt.init());
+        }
+    }
+
+    /// Write an H2 value into `packet`; must run before the MACs are computed.
+    fn set_resp_wire_type(&self, packet: &mut WgHandshakeResp) {
+        if let Some(wt) = &self.wire_types {
+            packet.set_wire_type(wt.resp());
+        }
     }
 }
 
