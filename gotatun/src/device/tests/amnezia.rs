@@ -539,8 +539,10 @@ async fn danger_timer_params_survive_set_amnezia() {
             .unwrap()
             .unwrap();
     }
+    // With a config set, only explicit params are reported.
     assert_eq!(timer_params(&bob).await, Some(explicit.clone()));
-    assert_eq!(timer_params(&alice).await, Some(from_cfg.clone()));
+    assert_eq!(timer_params(&alice).await, None);
+    assert_eq!(tunnel_params(&alice).await, from_cfg);
     ping(&alice, &mut bob, b"with timing ranges").await;
 
     // Clearing the explicit params falls back to the device's timing ranges.
@@ -548,7 +550,8 @@ async fn danger_timer_params_survive_set_amnezia() {
         .modify_peer(&alice_key, |p| p.dangerously_set_timer_params(None))
         .await
         .unwrap();
-    assert_eq!(timer_params(&bob).await, Some(from_cfg));
+    assert_eq!(timer_params(&bob).await, None);
+    assert_eq!(tunnel_params(&bob).await, from_cfg);
     bob.device
         .modify_peer(&alice_key, |p| {
             p.dangerously_set_timer_params(Some(explicit.clone()))
@@ -567,6 +570,32 @@ async fn danger_timer_params_survive_set_amnezia() {
     assert_eq!(timer_params(&bob).await, Some(explicit));
     assert_eq!(timer_params(&alice).await, Some(TimerParams::default()));
     ping(&bob, &mut alice, b"plain").await;
+}
+
+/// `peers()` reports only explicit timer params while a config is set, so
+/// writing the peers back does not pin the device's derived timing ranges:
+/// the peer still follows the next config.
+#[tokio::test]
+#[test_log::test]
+async fn peers_round_trip_does_not_pin_timing_ranges() {
+    let (alice, bob, _eve) = awg_pair(awg30()).await;
+    let peer = bob.device.peers().await.remove(0).peer;
+    assert_eq!(peer.danger_timer_params, None);
+
+    assert!(bob.device.update_peer(peer).await.unwrap());
+    let mut next = awg31();
+    next.timings.keepalive_timeout = secs(20, 25);
+    for device in [&alice, &bob] {
+        let next = next.clone();
+        device
+            .device
+            .write(async |d| d.set_amnezia(Some(next)).await)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(bob.device.peers().await[0].peer.danger_timer_params, None);
+    assert_eq!(tunnel_params(&bob).await, timer_params_from(&next.timings));
 }
 
 /// Invalid configs are rejected by the builder and by `set_amnezia`, which
@@ -605,6 +634,13 @@ async fn invalid_amnezia_config_is_rejected() {
 }
 
 /// The peer's UDP window as the device holds it.
+/// The timer params the device's only peer's tunnel runs with.
+async fn tunnel_params(device: &MockDevice) -> TimerParams {
+    let state = device.device.inner.read().await;
+    let peer = state.peers.values().next().expect("one peer");
+    peer.lock().await.tunnel.timer_params().clone()
+}
+
 async fn peer_window(device: &MockDevice) -> usize {
     let state = device.device.inner.read().await;
     let peer = state.peers.values().next().expect("one peer");

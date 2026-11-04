@@ -268,6 +268,19 @@ impl<T: DeviceTransports> DeviceState<T> {
         extras
     }
 
+    /// The timer params [`DeviceRead::peers`](super::DeviceRead::peers)
+    /// reports for `peer`. With a config set, only explicit params: the
+    /// tunnel's are derived from the timing ranges, and reporting them would
+    /// pin them as explicit when the peer is written back (as the UAPI `get`
+    /// already avoids). Without one, upstream's tunnel params.
+    pub(super) fn amnezia_reported_timer_params(&self, peer: &PeerState) -> Option<TimerParams> {
+        if self.amnezia.load().is_some() {
+            peer.danger_timer_params.clone()
+        } else {
+            Some(peer.tunnel.timer_params().clone())
+        }
+    }
+
     /// Record `params` as the peer's explicit timer params and return the
     /// params it gets: those, or the device-wide Amnezia timing ranges (`None`
     /// keeps upstream's default).

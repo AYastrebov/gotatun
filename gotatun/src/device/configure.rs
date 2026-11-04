@@ -221,7 +221,10 @@ impl<T: DeviceTransports> DeviceRead<'_, T> {
                     keepalive_range: p.keepalive_range.clone(),
                     #[cfg(feature = "daita")]
                     daita_settings: daita,
+                    #[cfg(not(feature = "amnezia"))]
                     danger_timer_params: Some(p.tunnel.timer_params().clone()),
+                    #[cfg(feature = "amnezia")]
+                    danger_timer_params: self.device.amnezia_reported_timer_params(&p),
                 },
                 stats,
             });
