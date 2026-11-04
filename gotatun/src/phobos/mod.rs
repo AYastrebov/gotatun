@@ -57,6 +57,7 @@ pub use transport::{
 
 /// A [`PhobosConfig`] field could not be set.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     /// A key has an unusable value.
     #[error("invalid value for `{field}`: {reason}")]

@@ -103,7 +103,7 @@ impl PhobosHandle {
     /// was bound, [`address_changed`](Self::address_changed) was called, an
     /// initiation failed to send, or a datagram was dropped before any
     /// initiation was tried on the current address. Clears the request.
-    pub fn take_initiation_request(&self) -> bool {
+    pub(crate) fn take_initiation_request(&self) -> bool {
         self.0.needs_initiation.swap(false, Ordering::AcqRel)
     }
 
