@@ -24,6 +24,10 @@ crate-type = ["cdylib", "rlib", "staticlib"]
 harness = false
 name = "main"
 
+[[bench]]
+name = "tunn_benches"
+harness = false
+
 [dependencies]
 aead = { workspace = true }
 base64 = { workspace = true }
