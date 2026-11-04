@@ -12,6 +12,8 @@ use thiserror::Error;
 
 use crate::packet::WgPacketType;
 
+pub use super::cps::CpsChain;
+
 /// Minimum value of `s1..s4` when header protection is enabled.
 pub const HEADER_PROTECTION_MIN_PADDING: u16 = 12;
 
@@ -67,6 +69,28 @@ pub enum ConfigError {
         field: String,
         /// Why it was rejected.
         reason: &'static str,
+    },
+    /// A CPS (`i1..i5`) chain is malformed.
+    #[error("invalid CPS chain: {reason}")]
+    InvalidCps {
+        /// Why it was rejected.
+        reason: String,
+    },
+    /// A CPS chain uses an unknown tag.
+    #[error("unsupported CPS tag `<{tag}>`")]
+    UnsupportedCpsTag {
+        /// The tag name.
+        tag: String,
+    },
+    /// A CPS tag length exceeds the largest UDP datagram.
+    #[error("CPS tag <{tag}> value {value} exceeds the maximum {max}")]
+    CpsValueOutOfRange {
+        /// The tag name.
+        tag: &'static str,
+        /// The offending value.
+        value: usize,
+        /// The maximum accepted value.
+        max: usize,
     },
     /// `s1..s4` is below the minimum required for header protection.
     #[error("{field} padding {value} is below the header-protection minimum {min}")]
@@ -223,18 +247,6 @@ pub struct Junk {
     pub min: u16,
     /// Maximum junk packet size.
     pub max: u16,
-}
-
-/// A parsed custom-protocol-signature (I-packet) chain.
-///
-/// For now this only holds the raw text; parsing is added later.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CpsChain(pub String);
-
-impl fmt::Display for CpsChain {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
 }
 
 /// The five optional I-packet chains (`i1..i5`). Gaps are allowed.
@@ -481,7 +493,11 @@ impl AmneziaConfig {
             "i1" | "i2" | "i3" | "i4" | "i5" => {
                 let idx = usize::from(key.as_bytes()[1] - b'1');
                 let v = value.trim();
-                self.init_packets.0[idx] = (!v.is_empty()).then(|| CpsChain(v.to_owned()));
+                self.init_packets.0[idx] = if v.is_empty() {
+                    None
+                } else {
+                    Some(CpsChain::parse(v)?)
+                };
             }
             "header_protection_key" => self.header_protection_key = parse_hp_key(value)?,
             "content_padding_addition" => {
