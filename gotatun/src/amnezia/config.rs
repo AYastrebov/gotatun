@@ -493,11 +493,7 @@ impl AmneziaConfig {
             "i1" | "i2" | "i3" | "i4" | "i5" => {
                 let idx = usize::from(key.as_bytes()[1] - b'1');
                 let v = value.trim();
-                self.init_packets.0[idx] = if v.is_empty() {
-                    None
-                } else {
-                    Some(CpsChain::parse(v)?)
-                };
+                self.init_packets.0[idx] = Some(CpsChain::parse(v)?).filter(|c| !c.is_empty());
             }
             "header_protection_key" => self.header_protection_key = parse_hp_key(value)?,
             "content_padding_addition" => {

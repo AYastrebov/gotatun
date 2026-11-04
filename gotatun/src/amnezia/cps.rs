@@ -9,8 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::config::ConfigError;
 use super::rng::RandomSource;
 
-/// Upper bound on an `<r>`/`<rc>`/`<rd>`/`<dz>` length: the largest UDP
-/// datagram, which is the only bound amneziawg-go has.
+/// Upper bound on an `<r>`/`<rc>`/`<rd>`/`<dz>` length. This cap is this
+/// implementation's own (the largest UDP datagram); amneziawg-go has none.
 pub(crate) const MAX_CPS_LEN: usize = u16::MAX as usize;
 
 const ALPHA: &[u8; 52] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -42,26 +42,28 @@ fn invalid(reason: impl Into<String>) -> ConfigError {
 
 impl CpsChain {
     /// Parse a chain such as `<b 0xdead><r 16><t>`.
+    ///
+    /// Acceptance mirrors amneziawg-go's `newObfChain`: text outside `<..>` is
+    /// ignored, extra tag arguments are ignored, `0x` on `<b>` is optional, and
+    /// a string with no tags yields an empty chain (see [`CpsChain::is_empty`]).
+    /// Unterminated, empty (`<>`), unknown or invalid tags are errors.
     pub fn parse(input: &str) -> Result<Self, ConfigError> {
-        let mut rest = input.trim_start();
+        let mut rest = input;
         let mut tags = Vec::new();
-        while !rest.is_empty() {
-            let body = rest.strip_prefix('<').ok_or_else(|| {
-                invalid(format!(
-                    "expected `<` at `{}`",
-                    rest.chars().next().unwrap_or(' ')
-                ))
-            })?;
+        while let Some(start) = rest.find('<') {
+            let body = &rest[start + 1..];
             let end = body
                 .find('>')
-                .ok_or_else(|| invalid("missing closing `>`"))?;
-            tags.push(parse_tag(body[..end].trim())?);
-            rest = body[end + 1..].trim_start();
-        }
-        if tags.is_empty() {
-            return Err(invalid("empty chain"));
+                .ok_or_else(|| invalid("missing enclosing >"))?;
+            tags.push(parse_tag(&body[..end])?);
+            rest = &body[end + 1..];
         }
         Ok(CpsChain { tags })
+    }
+
+    /// True if the chain has no tags (renders nothing, i.e. unset).
+    pub fn is_empty(&self) -> bool {
+        self.tags.is_empty()
     }
 
     /// Append the chain's bytes to `out`.
@@ -101,19 +103,13 @@ impl CpsChain {
 fn parse_tag(tag: &str) -> Result<CpsTag, ConfigError> {
     let mut parts = tag.split_whitespace();
     let name = parts.next().ok_or_else(|| invalid("empty tag"))?;
+    // Like Go, only the first argument is used; any others are ignored.
     let arg = parts.next();
-    if parts.next().is_some() {
-        return Err(invalid(format!("<{name}> has too many arguments")));
-    }
-    let no_arg = |t: CpsTag| match arg {
-        Some(_) => Err(invalid(format!("<{name}> does not take an argument"))),
-        None => Ok(t),
-    };
     match name {
         "b" => parse_bytes(arg),
-        "t" => no_arg(CpsTag::Timestamp),
-        "d" => no_arg(CpsTag::Data),
-        "ds" => no_arg(CpsTag::DataString),
+        "t" => Ok(CpsTag::Timestamp),
+        "d" => Ok(CpsTag::Data),
+        "ds" => Ok(CpsTag::DataString),
         "r" => parse_len("r", arg).map(CpsTag::RandomBytes),
         "rc" => parse_len("rc", arg).map(CpsTag::RandomChars),
         "rd" => parse_len("rd", arg).map(CpsTag::RandomDigits),
@@ -125,23 +121,21 @@ fn parse_tag(tag: &str) -> Result<CpsTag, ConfigError> {
 }
 
 fn parse_bytes(arg: Option<&str>) -> Result<CpsTag, ConfigError> {
-    let hex = arg
-        .and_then(|a| a.strip_prefix("0x"))
-        .ok_or_else(|| invalid("<b> requires a 0x-prefixed hex argument"))?;
+    let arg = arg.unwrap_or("");
+    let hex = arg.strip_prefix("0x").unwrap_or(arg);
     if hex.is_empty() {
-        return Err(invalid("<b> hex data is empty"));
+        return Err(invalid("<b> requires hex data"));
     }
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(invalid("<b> hex data must contain full bytes"));
     }
-    if !hex.is_ascii() {
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(invalid("<b> contains non-hex data"));
     }
     let bytes = (0..hex.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| invalid("<b> contains non-hex data"))?;
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("validated hex"))
+        .collect();
     Ok(CpsTag::Bytes(bytes))
 }
 
@@ -232,24 +226,21 @@ mod tests {
     }
 
     #[test]
-    fn cps_rejects_malformed() {
+    fn cps_rejects_what_go_rejects() {
         for bad in [
-            "",
-            "   ",
             "<r>",
             "<r x>",
             "<r -1>",
-            "<t 1>",
             "<b>",
-            "<b 12>",
             "<b 0x>",
             "<b 0xabc>",
             "<b 0xzz>",
+            "<b +a>",
             "<x 1>",
             "<r 1",
-            "r 1>",
-            "<r 1 2>",
             "<>",
+            "<  >",
+            "<t><>",
         ] {
             assert!(CpsChain::parse(bad).is_err(), "{bad:?} should be rejected");
         }
@@ -257,6 +248,24 @@ mod tests {
             CpsChain::parse("<x 1>"),
             Err(ConfigError::UnsupportedCpsTag { .. })
         ));
+    }
+
+    #[test]
+    fn cps_accepts_what_go_accepts() {
+        // 0x prefix optional.
+        assert_eq!(render("<b abcd>"), [0xab, 0xcd]);
+        assert_eq!(render("<b ABCD>"), [0xab, 0xcd]);
+        // Stray text outside tags is ignored.
+        assert_eq!(render("junk <b 0xaa> more <b 0xbb>tail"), [0xaa, 0xbb]);
+        // Extra arguments are ignored.
+        assert_eq!(render("<t 1>").len(), 4);
+        assert_eq!(render("<r 3 99>").len(), 3);
+        assert_eq!(render("<b 0xaa ignored>"), [0xaa]);
+        assert!(render("<d 5><ds x>").is_empty());
+        // No tags at all: empty chain, not an error.
+        for s in ["", "   ", "no tags here"] {
+            assert!(CpsChain::parse(s).unwrap().is_empty());
+        }
     }
 
     #[test]
