@@ -698,10 +698,15 @@ impl<T: DeviceTransports> DeviceState<T> {
                 };
 
                 #[cfg(feature = "phobos")]
-                let timers = if phobos_initiate {
-                    Ok(p.tunnel.format_handshake_initiation(true).map(WgKind::from))
-                } else {
-                    p.update_timers()
+                let timers = match p.update_timers() {
+                    // The tick produced nothing (no retransmit, keepalive or
+                    // expiry due): force the initiation the rebound socket
+                    // needs. A packet the timers did produce goes out as is;
+                    // an initiation among them opens the gate by itself.
+                    Ok(None) if phobos_initiate => {
+                        Ok(p.tunnel.format_handshake_initiation(true).map(WgKind::from))
+                    }
+                    other => other,
                 };
                 #[cfg(not(feature = "phobos"))]
                 let timers = p.update_timers();
