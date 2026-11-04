@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add the `phobos` feature: the client side of Phobos UDP obfuscation, as `PhobosUdpFactory`,
   `DeviceBuilder::with_phobos` and `PhobosHandle`. Embedders whose local address can change
   without a rebind must call `PhobosHandle::address_changed`. Off by default.
+- Add the `tunn_benches` benchmark (1400-byte encapsulate + decapsulate through two `Tunn`s).
+  With `amnezia` compiled in and no config it matches the build without it (2.264 us per packet
+  in both).
 - See `docs/amnezia.md`.
 
 ### Fixed

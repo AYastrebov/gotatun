@@ -83,6 +83,14 @@ range does not overflow (it does overlap the other ranges, as in Go).
 ### Rust API
 
 ```rust
+// Start from the default (plain WireGuard) and apply amneziawg-go key=value lines.
+// `?` is a `gotatun::amnezia::ConfigError` (bad value); `Ok(false)` means an unknown key.
+let mut cfg = AmneziaConfig::default();
+cfg.apply_uapi_line("jc", "4")?;
+cfg.apply_uapi_line("s1", "15")?;
+cfg.apply_uapi_line("h1", "100000-200000")?;
+cfg.validate()?;   // rules that span several keys; with_amnezia/set_amnezia check it again
+
 // at build time; fails with Error::Amnezia if the config is invalid
 let device = DeviceBuilder::new()
     .with_amnezia(cfg)
@@ -91,6 +99,7 @@ let device = DeviceBuilder::new()
 // at run time: validate, swap in place, rebuild peer tunnels
 // `None` turns obfuscation off
 device.write(async |w| w.set_amnezia(Some(cfg)).await).await??;
+// the first `?` is the device `Error` from `write`, the second the `ConfigError`
 ```
 
 `set_amnezia` keeps the UDP sockets (an embedder may hand over one pre-bound socket pair that
@@ -101,9 +110,17 @@ config again is a no-op.
 
 ### MTU
 
-Every transport packet grows by `S4` bytes on the wire, and GotaTun does not track the outer MTU.
-**Lower the inner (TUN) MTU by `AmneziaConfig::transport_overhead()`** (which is `s4`). With
-Phobos, lower it by `Masking::overhead()` instead (see below). Content padding is clamped by the
+GotaTun does not track the outer MTU, so the inner (TUN) MTU must be set by the embedder:
+
+```text
+inner MTU = outer path MTU
+          - IP/UDP header (28 for IPv4, 48 for IPv6)
+          - 32 (WireGuard transport overhead)
+          - AmneziaConfig::transport_overhead()   (= s4, AmneziaWG)
+            or Masking::overhead()                (Phobos)
+```
+
+For a 1500-byte IPv4 path that is `1500 - 28 - 32 - s4` (1420 minus `s4`). Content padding is clamped by the
 UDP window, the live TUN MTU and the buffer, but the MTU clamp is conservative: it compares the
 inner MTU with the whole outer datagram.
 
@@ -202,6 +219,12 @@ UAPI surface.
 
 ### Embedder duty: `address_changed()`
 
+`DeviceBuilder::with_phobos(cfg)` keeps the `PhobosHandle` private and is for the default sockets
+only. An embedder that needs `address_changed()` (for example shoes switching Direct and Detour,
+or any path or address change without a rebind) must instead build
+`PhobosUdpFactory::new(inner, cfg)?`, keep the returned `PhobosHandle`, and register a clone with
+`DeviceBuilder::with_udp(factory).with_phobos_handle(handle.clone())`.
+
 A new `bind()` is noticed by the factory, but a change of local address or path **without a
 rebind** (route change, NAT rebinding, an embedder switching Direct and Detour paths under a
 single socket) is not. Call `PhobosHandle::address_changed()` whenever that happens. It closes
@@ -212,14 +235,25 @@ the tunnel silent until the next rekey.
 
 Lower the tunnel MTU by `Masking::overhead()` (0 for `None`, 24 for `Stun`, 12 for `Media`). The
 random tail added to cookie and transport messages (`max-dummy`) is only added while a message is
-under 1024 bytes, so large packets are not padded further. With `Stun` the framed message may not
+under 1024 bytes, so large packets are not padded further (the same 1024 cap bounds the dummy tail
+of handshake messages). With `Stun` the framed message may not
 exceed `Masking::max_message_len()`.
 
 ## Throughput
 
-`cargo bench -p gotatun --bench throughput_benches` shows no difference beyond noise between
-`--features device` and `--features device,amnezia` with no config; see the commit that
-introduced this document for the numbers.
+The existing `throughput_benches` and `crypto_benches` never touch `Tunn` or the device path, so
+they cannot show the cost of compiling `amnezia` in. `cargo bench -p gotatun --bench tunn_benches`
+does: it completes a handshake between two `Tunn`s and loops encapsulate + decapsulate of a
+1400-byte IPv4 packet (`Tunn::handle_outgoing_packet` and `handle_incoming_packet`, no TUN MTU,
+no Amnezia config). Measured with `-- --warm-up-time 1 --measurement-time 5`:
+
+| Features | Median time per packet | Throughput |
+|---|---|---|
+| `device` | 2.2642 us | 589.67 MiB/s |
+| `device,amnezia` (no config) | 2.2641 us | 589.70 MiB/s |
+
+The difference is far below criterion's noise. The bench runs the `Tunn` hot path only (no UDP
+sockets or device tasks).
 
 ## Testing against a live AmneziaWG server
 
