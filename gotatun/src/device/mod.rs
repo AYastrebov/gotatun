@@ -731,8 +731,9 @@ impl<T: DeviceTransports> DeviceState<T> {
         // With Amnezia configured, every datagram is de-obfuscated and
         // verified as the kind it classifies as.
         #[cfg(feature = "amnezia")]
-        let rate_limiter =
-            amnezia::ReceiveGate::new(rate_limiter, Self::amnezia_cell(&device).await);
+        let Some(rate_limiter) = Self::amnezia_receive_gate(&device, rate_limiter).await else {
+            return Ok(());
+        };
 
         loop {
             let (src_buf, addr) = udp_rx

@@ -410,7 +410,13 @@ mod tests {
     /// Opening a sealed datagram gives back the message, H value included.
     fn assert_opens(cfg: &AmneziaConfig, kind: WgPacketType, msg: &[u8], datagram: &Packet) {
         let deob = Deobfuscator::new(Arc::new(cfg.clone()));
-        let (opened, got) = deob.open(datagram.clone()).expect("datagram classifies");
+        // As a device would: only a real transport packet carries a receiver
+        // index it knows, so a handshake misread as transport is read again
+        // (ruling R14; this used to flake at |H4| / 2^32 with OS randomness).
+        let known_idx = |_| kind == WgPacketType::Data;
+        let (opened, got) = deob
+            .open_with(datagram.clone(), known_idx)
+            .expect("datagram classifies");
         assert_eq!(got, kind);
         assert_eq!(&opened[4..], &msg[4..], "{kind:?}: body");
         let h = u32::from_le_bytes(opened[..4].try_into().unwrap());

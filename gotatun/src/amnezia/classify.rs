@@ -56,6 +56,41 @@ impl Deobfuscator {
     /// then checking the (unprotected) type value at that offset against the
     /// type's H range. `None` for junk, I-packets and garbage.
     pub(crate) fn classify(&self, src: &[u8]) -> Option<Classified> {
+        // Every candidate's prefix starts at byte 0, so they all share the
+        // nonce `src[..12]`: derive the keystream once and reuse it, both for
+        // the type checks and (via `Classified::mask`) for unprotecting.
+        let mask = match self.header_protection {
+            Some(hp) => {
+                let nonce: &[u8; HEADER_PROTECTION_NONCE_SIZE] =
+                    src.get(..HEADER_PROTECTION_NONCE_SIZE)?.try_into().ok()?;
+                Some(hp.mask(nonce))
+            }
+            None => None,
+        };
+        self.classify_masked(src, mask, true)
+    }
+
+    /// Classify `src` again as a handshake-type message only, reusing the
+    /// keystream of its first classification `first`.
+    ///
+    /// With AWG 3.1 trailers transport is tried first, so a handshake whose
+    /// bytes at offset S4 happen to fall in the H4 range (|H4| / 2^32 of
+    /// them) is first taken for transport. Its "receiver index" is then
+    /// random, so the receiver asks for this second reading (ruling R14).
+    pub(crate) fn reclassify_handshake(
+        &self,
+        src: &[u8],
+        first: &Classified,
+    ) -> Option<Classified> {
+        self.classify_masked(src, first.mask, false)
+    }
+
+    fn classify_masked(
+        &self,
+        src: &[u8],
+        mask: Option<[u8; HEADER_PROTECTION_MASK_LEN]>,
+        with_transport: bool,
+    ) -> Option<Classified> {
         let cfg = &*self.cfg;
         let p = &cfg.padding;
         let h = &cfg.headers;
@@ -104,43 +139,34 @@ impl Deobfuscator {
             [init, response, cookie, transport]
         };
 
-        // Every candidate's prefix starts at byte 0, so they all share the
-        // nonce `src[..12]`: derive the keystream once and reuse it, both for
-        // the type checks and (via `Classified::mask`) for unprotecting.
-        let mask = match self.header_protection {
-            Some(hp) => {
-                let nonce: &[u8; HEADER_PROTECTION_NONCE_SIZE] =
-                    src.get(..HEADER_PROTECTION_NONCE_SIZE)?.try_into().ok()?;
-                Some(hp.mask(nonce))
-            }
-            None => None,
-        };
-
-        candidates.into_iter().find_map(|c| {
-            let min_len = c.prefix.checked_add(c.size)?;
-            let size_ok = if c.fixed && !cfg.random_trailers {
-                src.len() == min_len
-            } else {
-                src.len() >= min_len
-            };
-            if !size_ok {
-                return None;
-            }
-            let mut type_bytes: [u8; 4] = src.get(c.prefix..c.prefix + 4)?.try_into().ok()?;
-            if let Some(mask) = &mask {
-                for (b, m) in type_bytes.iter_mut().zip(mask) {
-                    *b ^= m;
+        candidates
+            .into_iter()
+            .filter(|c| with_transport || c.kind != WgPacketType::Data)
+            .find_map(|c| {
+                let min_len = c.prefix.checked_add(c.size)?;
+                let size_ok = if c.fixed && !cfg.random_trailers {
+                    src.len() == min_len
+                } else {
+                    src.len() >= min_len
+                };
+                if !size_ok {
+                    return None;
                 }
-            }
-            let value = u32::from_le_bytes(type_bytes);
-            (c.range.start <= value && value <= c.range.end).then_some(Classified {
-                kind: c.kind,
-                prefix: c.prefix,
-                protected_len: c.protected_len,
-                msg_size: c.fixed.then_some(c.size),
-                mask,
+                let mut type_bytes: [u8; 4] = src.get(c.prefix..c.prefix + 4)?.try_into().ok()?;
+                if let Some(mask) = &mask {
+                    for (b, m) in type_bytes.iter_mut().zip(mask) {
+                        *b ^= m;
+                    }
+                }
+                let value = u32::from_le_bytes(type_bytes);
+                (c.range.start <= value && value <= c.range.end).then_some(Classified {
+                    kind: c.kind,
+                    prefix: c.prefix,
+                    protected_len: c.protected_len,
+                    msg_size: c.fixed.then_some(c.size),
+                    mask,
+                })
             })
-        })
     }
 
     /// Turn an inbound datagram into a plain WireGuard message: classify,
@@ -148,8 +174,36 @@ impl Deobfuscator {
     ///
     /// The H value stays in the type field so MACs still verify over the raw
     /// bytes. Returns `None` (drop silently) for junk, I-packets and garbage.
-    pub(crate) fn open(&self, mut packet: Packet) -> Option<(Packet, WgPacketType)> {
-        let c = self.classify(&packet)?;
+    #[cfg(test)]
+    pub(crate) fn open(&self, packet: Packet) -> Option<(Packet, WgPacketType)> {
+        self.open_with(packet, |_| true)
+    }
+
+    /// [`Deobfuscator::open`], for a receiver that can tell whether a
+    /// transport receiver index is one of its own (`known_idx`).
+    ///
+    /// With AWG 3.1 trailers a datagram that classifies as transport but
+    /// carries an unknown receiver index is classified again as a handshake
+    /// type (see [`Deobfuscator::reclassify_handshake`]); if it is one, that
+    /// reading wins. `known_idx` is asked only with trailers on, before
+    /// anything is modified, so no copy is kept.
+    pub(crate) fn open_with(
+        &self,
+        packet: Packet,
+        known_idx: impl FnOnce(u32) -> bool,
+    ) -> Option<(Packet, WgPacketType)> {
+        let mut c = self.classify(&packet)?;
+        if c.kind == WgPacketType::Data
+            && self.cfg.random_trailers
+            && !known_idx(transport_receiver_idx(&packet, &c))
+            && let Some(handshake) = self.reclassify_handshake(&packet, &c)
+        {
+            c = handshake;
+        }
+        Some(self.open_classified(packet, c))
+    }
+
+    fn open_classified(&self, mut packet: Packet, c: Classified) -> (Packet, WgPacketType) {
         packet.buf_mut().advance(c.prefix);
         if let Some(mask) = &c.mask {
             let n = c.protected_len.min(packet.len());
@@ -160,8 +214,23 @@ impl Deobfuscator {
         if let Some(size) = c.msg_size {
             packet.truncate(size);
         }
-        Some((packet, c.kind))
+        (packet, c.kind)
     }
+}
+
+/// The receiver index of a datagram classified as transport, unprotected.
+fn transport_receiver_idx(src: &[u8], c: &Classified) -> u32 {
+    const IDX: std::ops::Range<usize> = 4..8;
+    let mut idx = [0u8; 4];
+    if let Some(bytes) = src.get(c.prefix + IDX.start..c.prefix + IDX.end) {
+        idx.copy_from_slice(bytes);
+    }
+    if let Some(mask) = &c.mask {
+        for (b, m) in idx.iter_mut().zip(&mask[IDX]) {
+            *b ^= m;
+        }
+    }
+    u32::from_le_bytes(idx)
 }
 
 /// One message type's framing, as tried by [`Deobfuscator::classify`].
@@ -433,6 +502,57 @@ mod tests {
                 "{stolen} of {N} transport packets misclassified \
                  (random_trailers = {random_trailers})"
             );
+        }
+    }
+
+    /// R14: with trailers on, a handshake whose 4 bytes at offset S4 (after
+    /// unmasking) fall in H4 is first taken for transport. Its receiver index
+    /// is then unknown, and the handshake-only reading recovers it.
+    #[test]
+    fn handshake_misread_as_transport_is_recovered() {
+        for hp in [false, true] {
+            let mut cfg = awg_cfg(hp, true);
+            // Wide H4 so the misreading is common enough to find quickly.
+            cfg.headers.transport = HeaderRange {
+                start: 100_000_000,
+                end: 4_000_000_000,
+            };
+            let deob = Deobfuscator::new(Arc::new(cfg.clone()));
+            for (kind, len) in kinds().into_iter().take(3) {
+                let msg = wg_message(kind, len);
+                let (datagram, first) = (0..)
+                    .map(|seed| seal(&cfg, kind, &msg, 500, &mut DetRng::new(seed)))
+                    .find_map(|d| {
+                        let c = deob.classify(&d).expect("classifies");
+                        (c.kind == WgPacketType::Data).then_some((d, c))
+                    })
+                    .expect("some datagram is misread");
+                let p = usize::from(cfg.padding.s4);
+                let mut type_bytes: [u8; 4] = datagram[p..p + 4].try_into().unwrap();
+                if let Some(mask) = first.mask {
+                    for (b, m) in type_bytes.iter_mut().zip(mask) {
+                        *b ^= m;
+                    }
+                }
+                let h = u32::from_le_bytes(type_bytes);
+                assert!(
+                    (cfg.headers.transport.start..=cfg.headers.transport.end).contains(&h),
+                    "{kind:?}: bytes at S4 are in H4"
+                );
+
+                let again = deob
+                    .reclassify_handshake(&datagram, &first)
+                    .expect("handshake-only reading");
+                assert_eq!(again.kind, kind, "hp={hp}");
+
+                // A known index keeps the transport reading; an unknown one
+                // takes the handshake reading, opened intact.
+                let (_, got) = deob.open_with(packet(&datagram), |_| true).unwrap();
+                assert_eq!(got, WgPacketType::Data);
+                let (opened, got) = deob.open_with(packet(&datagram), |_| false).unwrap();
+                assert_eq!(got, kind);
+                assert_eq!(&opened[4..], &msg[4..], "{kind:?}: body");
+            }
         }
     }
 
