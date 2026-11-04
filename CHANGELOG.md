@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Add `gotatun-packet` module.
 - Add `gotatun-crypto` module.
+- Add the `amnezia` feature: AmneziaWG 2.0, 3.0 and 3.1 obfuscation (junk packets, padding, header
+  ranges, signature packets, header protection, content padding, randomized timers, random
+  trailers, `disable_cookies`), interoperable with amneziawg-go. Configure it with
+  `DeviceBuilder::with_amnezia`, `DeviceWrite::set_amnezia` or the UAPI keys in `UAPI.md`.
+  Off by default.
+- Add the `phobos` feature: the client side of Phobos UDP obfuscation, as `PhobosUdpFactory`,
+  `DeviceBuilder::with_phobos` and `PhobosHandle`. Embedders whose local address can change
+  without a rebind must call `PhobosHandle::address_changed`. Off by default.
+- See `docs/amnezia.md`.
+
+### Fixed
+- With the `amnezia` feature, the handshake TAI64N timestamp uses the epoch of kernel WireGuard
+  and amneziawg-go (`2^62 + 10`) instead of `2^62 + 37`, which ran 27 seconds ahead.
+- Fix the mock UDP channel's IPv6 flow label overflowing 20 bits in tests.
 
 
 ## [0.10.2] - 2026-10-20
