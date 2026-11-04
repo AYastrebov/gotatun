@@ -12,5 +12,7 @@ pub(crate) mod header_protection;
 pub(crate) mod junk;
 #[allow(dead_code)]
 pub(crate) mod rng;
+#[allow(dead_code)]
+pub(crate) mod tunn_state;
 
 pub use config::*;
