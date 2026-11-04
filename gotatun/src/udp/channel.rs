@@ -186,7 +186,8 @@ impl UdpTransportFactory for UdpChannelFactory {
         &mut self,
         params: &UdpTransportFactoryParams,
     ) -> io::Result<(Self::Send, Self::Recv)> {
-        let connection_id = rand::random_range(1..=u32::MAX);
+        // Sent as the IPv6 flow label, which is 20 bits wide.
+        let connection_id = rand::random_range(1..=0xF_FFFF);
         let source_port = match params.port {
             0 => rand::random_range(1..=u16::MAX),
             p => p,
