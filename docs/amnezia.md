@@ -120,7 +120,8 @@ inner MTU = outer path MTU
             or Masking::overhead()                (Phobos)
 ```
 
-For a 1500-byte IPv4 path that is `1500 - 28 - 32 - s4` (1420 minus `s4`). Content padding is clamped by the
+For a 1500-byte path that is `1500 - 28 - 32 = 1440` minus `s4` on IPv4, and
+`1500 - 48 - 32 = 1420` minus `s4` on IPv6. The usual WireGuard 1420 is the IPv6-safe figure. Content padding is clamped by the
 UDP window, the live TUN MTU and the buffer, but the MTU clamp is conservative: it compares the
 inner MTU with the whole outer datagram.
 
@@ -330,6 +331,8 @@ AmneziaWG `.conf` of a working server, root, and `socat`. All values below are p
    ping -c 4 <server tunnel ip>
    printf 'get=1\n\n' | sudo socat - UNIX-CONNECT:/var/run/wireguard/awgtest0.sock
    ```
+
+   (`1420 - s4` is the IPv6-safe MTU for a 1500-byte path; see MTU above.)
 
    Healthy: 0% loss, a `last_handshake_time_sec` line, and `get=1` echoes back every AmneziaWG
    key that was set. `rx_bytes`/`tx_bytes` stay at 0 until real traffic flows.
