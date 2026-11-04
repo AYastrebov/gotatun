@@ -19,6 +19,8 @@
 // `RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features`
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+#[cfg(feature = "amnezia")]
+pub mod amnezia;
 #[cfg(feature = "device")]
 pub mod device;
 pub mod noise;
