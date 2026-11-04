@@ -197,7 +197,7 @@ mod tests {
         cfg: &AmneziaConfig,
         kind: WgPacketType,
         msg: &[u8],
-        mut window: usize,
+        window: usize,
         rng: &mut DetRng,
     ) -> Vec<u8> {
         let mut msg = msg.to_vec();
@@ -213,7 +213,7 @@ mod tests {
             .expect("well-formed message");
         let mut out = Vec::new();
         Obfuscator::new(Arc::new(cfg.clone()))
-            .seal_with(packet, &mut window, &mut out, rng, NOW)
+            .seal_with(packet, window, &mut out, rng, NOW)
             .expect("fits in a datagram");
         out.pop().expect("message datagram").to_vec()
     }
@@ -368,6 +368,11 @@ mod tests {
                 assert_opened(&cfg, kind, &msg, &datagram);
 
                 // A window the message already fills: zero-length trailer.
+                // (Cookie replies always size theirs against the default
+                // window instead, as amneziawg-go does.)
+                if kind == WgPacketType::CookieReply {
+                    continue;
+                }
                 let datagram = seal(&cfg, kind, &msg, base, &mut rng);
                 assert_eq!(datagram.len(), base, "{kind:?}: no trailer");
                 assert_opened(&cfg, kind, &msg, &datagram);

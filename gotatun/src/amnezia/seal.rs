@@ -10,6 +10,7 @@ use std::sync::Arc;
 use bytes::BytesMut;
 use zerocopy::IntoBytes;
 
+use super::config::HEADER_PROTECTION_MIN_PADDING;
 use super::config::{AmneziaConfig, HeaderRange};
 use super::cps::unix_now_secs;
 use super::header_protection::{
@@ -18,6 +19,7 @@ use super::header_protection::{
 };
 use super::junk::random_trailer_len;
 use super::rng::{FastRandom, RandomSource};
+use super::tunn_state::INITIAL_UDP_WINDOW;
 use crate::packet::{Packet, WgCookieReply, WgData, WgHandshakeInit, WgHandshakeResp, WgKind};
 
 /// Largest UDP payload a datagram can carry.
@@ -48,6 +50,14 @@ impl Obfuscator {
     /// `cfg` must have passed [`AmneziaConfig::validate`]: header protection
     /// takes its nonce from the first 12 prefix bytes, so it needs S1..S4 >= 12.
     pub(crate) fn new(cfg: Arc<AmneziaConfig>) -> Self {
+        let p = &cfg.padding;
+        debug_assert!(
+            cfg.header_protection_key.is_none()
+                || [p.s1, p.s2, p.s3, p.s4]
+                    .iter()
+                    .all(|s| *s >= HEADER_PROTECTION_MIN_PADDING),
+            "header protection needs S1..S4 >= 12; validate the config first"
+        );
         let hp = cfg.header_protection_key.map(HeaderProtection::new);
         Obfuscator { cfg, hp }
     }
@@ -57,14 +67,17 @@ impl Obfuscator {
     /// A handshake initiation is preceded by the set I1..I5 packets and then
     /// Jc junk datagrams. Handshake initiations and responses must already
     /// carry their H1/H2 value (written before their MACs); cookie replies
-    /// and transport packets get H3/H4 here. `window` is the peer's UDP window:
-    /// it bounds trailer lengths and transport packets widen it.
+    /// and transport packets get H3/H4 here. `window` is the peer's UDP
+    /// window, read only to size init and response trailers; cookie replies
+    /// always use the default 500 (amneziawg-go's `device.randomTrailer`).
+    /// `seal` never widens it: amneziawg-go widens with the pre-padding size,
+    /// which only the tunnel knows.
     ///
     /// On error `out` is left as it was.
     pub(crate) fn seal(
         &self,
         packet: WgKind,
-        window: &mut usize,
+        window: usize,
         out: &mut Vec<Packet>,
     ) -> Result<(), SealError> {
         self.seal_with(packet, window, out, &mut FastRandom, unix_now_secs())
@@ -74,7 +87,7 @@ impl Obfuscator {
     pub(crate) fn seal_with(
         &self,
         packet: WgKind,
-        window: &mut usize,
+        window: usize,
         out: &mut Vec<Packet>,
         rng: &mut dyn RandomSource,
         unix_secs: u32,
@@ -87,7 +100,7 @@ impl Obfuscator {
                     out.truncate(start);
                     return Err(e);
                 }
-                match self.frame(packet.as_bytes(), p.s1, PROTECTED_LEN_INIT, *window, rng) {
+                match self.frame(packet.as_bytes(), p.s1, PROTECTED_LEN_INIT, window, rng) {
                     Ok(datagram) => datagram,
                     Err(e) => {
                         out.truncate(start);
@@ -95,25 +108,30 @@ impl Obfuscator {
                     }
                 }
             }
-            WgKind::HandshakeResp(packet) => self.frame(
-                packet.as_bytes(),
-                p.s2,
-                PROTECTED_LEN_RESPONSE,
-                *window,
-                rng,
-            )?,
+            WgKind::HandshakeResp(packet) => {
+                self.frame(packet.as_bytes(), p.s2, PROTECTED_LEN_RESPONSE, window, rng)?
+            }
             WgKind::CookieReply(mut packet) => {
                 packet.set_wire_type(pick(rng, self.cfg.headers.cookie));
-                self.frame(packet.as_bytes(), p.s3, PROTECTED_LEN_COOKIE, *window, rng)?
+                // Cookie replies go out before any peer is known, so Go sizes
+                // their trailer against the fixed default window.
+                self.frame(
+                    packet.as_bytes(),
+                    p.s3,
+                    PROTECTED_LEN_COOKIE,
+                    INITIAL_UDP_WINDOW,
+                    rng,
+                )?
             }
-            WgKind::Data(packet) => self.seal_transport(packet, window, rng)?,
+            WgKind::Data(packet) => self.seal_transport(packet, rng)?,
         };
         out.push(datagram);
         Ok(())
     }
 
-    /// I1..I5 (unset or empty-rendering ones skipped), then Jc junk datagrams,
-    /// as amneziawg-go's `SendHandshakeInitiation` queues them.
+    /// I1..I5 (unset ones skipped), then Jc junk datagrams, as amneziawg-go's
+    /// `SendHandshakeInitiation` queues them. A set chain that renders no
+    /// bytes still sends an empty datagram, as Go does.
     fn push_pre_handshake(
         &self,
         out: &mut Vec<Packet>,
@@ -123,9 +141,6 @@ impl Obfuscator {
         for chain in self.cfg.init_packets.0.iter().flatten() {
             let mut buf = Vec::new();
             chain.render_at(rng, unix_secs, &mut buf);
-            if buf.is_empty() {
-                continue;
-            }
             if buf.len() > MAX_DATAGRAM_LEN {
                 return Err(SealError::TooLarge);
             }
@@ -183,7 +198,6 @@ impl Obfuscator {
     fn seal_transport(
         &self,
         mut packet: Packet<WgData>,
-        window: &mut usize,
         rng: &mut dyn RandomSource,
     ) -> Result<Packet, SealError> {
         packet
@@ -231,7 +245,6 @@ impl Obfuscator {
             }
         }
 
-        *window = (*window).max(len);
         Ok(Packet::from_bytes(buf))
     }
 
@@ -380,7 +393,7 @@ mod tests {
         cfg: &AmneziaConfig,
         kind: WgPacketType,
         msg: &[u8],
-        window: &mut usize,
+        window: usize,
         rng: &mut DetRng,
     ) -> Result<Vec<Packet>, SealError> {
         let mut out = Vec::new();
@@ -419,8 +432,7 @@ mod tests {
                 let cfg = awg_cfg(hp, trailers);
                 for (kind, len) in kinds() {
                     let msg = message(&cfg, kind, len, &mut rng);
-                    let mut window = 500;
-                    let out = seal_det(&cfg, kind, &msg, &mut window, &mut rng).unwrap();
+                    let out = seal_det(&cfg, kind, &msg, 500, &mut rng).unwrap();
                     let datagram = out.last().unwrap();
                     let base = prefix_of(&cfg, kind) + len;
                     if trailers && kind != WgPacketType::Data {
@@ -450,7 +462,7 @@ mod tests {
         );
         let mut out = Vec::new();
         Obfuscator::new(Arc::new(cfg.clone()))
-            .seal(wg(WgPacketType::HandshakeResp, &msg), &mut 500, &mut out)
+            .seal(wg(WgPacketType::HandshakeResp, &msg), 500, &mut out)
             .unwrap();
         assert_eq!(out.len(), 1);
         assert_opens(&cfg, WgPacketType::HandshakeResp, &msg, &out[0]);
@@ -464,7 +476,7 @@ mod tests {
             None,
             Some(CpsChain::parse("<rc 5>").unwrap()),
             None,
-            // Renders nothing; no empty datagram goes out for it.
+            // Renders nothing, so an empty datagram goes out for it (as Go).
             Some(CpsChain::parse("<d>").unwrap()),
         ]);
         let mut rng = DetRng::new(3);
@@ -474,23 +486,24 @@ mod tests {
             WgHandshakeInit::LEN,
             &mut rng,
         );
-        let out = seal_det(&cfg, WgPacketType::HandshakeInit, &msg, &mut 500, &mut rng).unwrap();
+        let out = seal_det(&cfg, WgPacketType::HandshakeInit, &msg, 500, &mut rng).unwrap();
 
-        assert_eq!(out.len(), 2 + 3 + 1, "I1, I3, three junk, then the init");
+        assert_eq!(out.len(), 3 + 3 + 1, "I1, I3, I5, three junk, the init");
         assert_eq!(out[0].len(), 3 + 4 + 10);
         assert_eq!(&out[0][..3], &[0xc0, 0xff, 0xee]);
         assert_eq!(&out[0][3..7], &NOW.to_be_bytes(), "<t> stamped");
         assert_eq!(out[1].len(), 5);
         assert!(out[1].iter().all(u8::is_ascii_alphabetic));
-        for junk in &out[2..5] {
+        assert!(out[2].is_empty(), "I5 renders to an empty datagram");
+        for junk in &out[3..6] {
             assert!((40..90).contains(&junk.len()), "junk size {}", junk.len());
         }
-        assert_opens(&cfg, WgPacketType::HandshakeInit, &msg, &out[5]);
+        assert_opens(&cfg, WgPacketType::HandshakeInit, &msg, &out[6]);
 
         // Only initiations get them.
         for (kind, len) in kinds().into_iter().skip(1) {
             let msg = message(&cfg, kind, len, &mut rng);
-            let out = seal_det(&cfg, kind, &msg, &mut 500, &mut rng).unwrap();
+            let out = seal_det(&cfg, kind, &msg, 500, &mut rng).unwrap();
             assert_eq!(out.len(), 1, "{kind:?}");
         }
     }
@@ -506,7 +519,7 @@ mod tests {
             let mut lens = std::collections::HashSet::new();
             for _ in 0..32 {
                 let msg = message(&cfg, kind, WgCookieReply::LEN, &mut rng);
-                let out = seal_det(&cfg, kind, &msg, &mut 500, &mut rng).unwrap();
+                let out = seal_det(&cfg, kind, &msg, 500, &mut rng).unwrap();
                 let d = &out[0];
                 assert!(d.len() >= base && d.len() < 500, "len {}", d.len());
                 lens.insert(d.len());
@@ -515,12 +528,19 @@ mod tests {
             assert!(lens.len() > 1, "trailer length varies");
             assert!(lens.iter().any(|l| *l > base), "a trailer was appended");
 
-            // A window the reply already fills leaves a zero-length trailer.
-            let msg = message(&cfg, kind, WgCookieReply::LEN, &mut rng);
-            let mut window = base;
-            let out = seal_det(&cfg, kind, &msg, &mut window, &mut rng).unwrap();
-            assert_eq!(out[0].len(), base);
-            assert_opens(&cfg, kind, &msg, &out[0]);
+            // Like amneziawg-go's `device.randomTrailer`, the cookie trailer
+            // is sized against the fixed default window, whatever is passed.
+            for window in [base, 10_000] {
+                let mut lens = std::collections::HashSet::new();
+                for _ in 0..32 {
+                    let msg = message(&cfg, kind, WgCookieReply::LEN, &mut rng);
+                    let out = seal_det(&cfg, kind, &msg, window, &mut rng).unwrap();
+                    assert!(out[0].len() < 500, "window {window}: len {}", out[0].len());
+                    lens.insert(out[0].len());
+                    assert_opens(&cfg, kind, &msg, &out[0]);
+                }
+                assert!(lens.iter().any(|l| *l > base), "window {window}: trailer");
+            }
         }
     }
 
@@ -531,27 +551,44 @@ mod tests {
         for hp in [false, true] {
             let cfg = awg_cfg(hp, true);
             let msg = message(&cfg, WgPacketType::Data, WgData::OVERHEAD, &mut rng);
-            let out = seal_det(&cfg, WgPacketType::Data, &msg, &mut 500, &mut rng).unwrap();
+            let out = seal_det(&cfg, WgPacketType::Data, &msg, 500, &mut rng).unwrap();
             assert_eq!(out.len(), 1);
             assert_eq!(out[0].len(), usize::from(cfg.padding.s4) + WgData::OVERHEAD);
             assert_opens(&cfg, WgPacketType::Data, &msg, &out[0]);
         }
     }
 
+    /// `seal` reads the window only to size trailers; it never widens it
+    /// (the tunnel does, with the pre-padding size, as amneziawg-go does).
     #[test]
-    fn transport_widens_udp_window_handshakes_do_not() {
+    fn seal_leaves_udp_window_alone() {
         let mut rng = DetRng::new(6);
         let cfg = awg_cfg(true, true);
-        let len = WgData::OVERHEAD + 1000;
-        let msg = message(&cfg, WgPacketType::Data, len, &mut rng);
-        let mut window = 500;
-        seal_det(&cfg, WgPacketType::Data, &msg, &mut window, &mut rng).unwrap();
-        assert_eq!(window, usize::from(cfg.padding.s4) + len);
-        let msg = message(&cfg, WgPacketType::Data, WgData::OVERHEAD, &mut rng);
-        seal_det(&cfg, WgPacketType::Data, &msg, &mut window, &mut rng).unwrap();
-        assert_eq!(window, usize::from(cfg.padding.s4) + len, "never narrows");
+        let obf = Obfuscator::new(Arc::new(cfg.clone()));
+        let window: usize = 500;
+        for (kind, len) in [
+            (WgPacketType::Data, WgData::OVERHEAD + 1000),
+            (WgPacketType::HandshakeInit, WgHandshakeInit::LEN),
+            (WgPacketType::HandshakeResp, WgHandshakeResp::LEN),
+            (WgPacketType::CookieReply, WgCookieReply::LEN),
+        ] {
+            let msg = message(&cfg, kind, len, &mut rng);
+            let mut out = Vec::new();
+            obf.seal_with(wg(kind, &msg), window, &mut out, &mut rng, NOW)
+                .unwrap();
+            let datagram = out.last().unwrap();
+            if kind == WgPacketType::Data {
+                assert!(datagram.len() > window, "a datagram larger than the window");
+            } else {
+                assert!(
+                    datagram.len() < window,
+                    "{kind:?}: trailer within the window"
+                );
+            }
+        }
+        assert_eq!(window, 500);
 
-        // Like amneziawg-go, only transport packets widen the window.
+        // A handshake that already exceeds the window gets no trailer.
         let mut big = cfg.clone();
         big.padding.s2 = 900;
         let msg = message(
@@ -560,21 +597,12 @@ mod tests {
             WgHandshakeResp::LEN,
             &mut rng,
         );
-        let mut window = 500;
-        let out = seal_det(
-            &big,
-            WgPacketType::HandshakeResp,
-            &msg,
-            &mut window,
-            &mut rng,
-        )
-        .unwrap();
+        let out = seal_det(&big, WgPacketType::HandshakeResp, &msg, 500, &mut rng).unwrap();
         assert_eq!(
             out[0].len(),
             900 + WgHandshakeResp::LEN,
             "no room for a trailer"
         );
-        assert_eq!(window, 500);
     }
 
     /// amneziawg-go's unpatched `DeterminePacketTypeAndPadding`: init,
@@ -657,7 +685,7 @@ mod tests {
                 rng.fill(&mut payload[16..]);
                 let msg = message(&cfg, WgPacketType::Data, payload.len(), &mut rng);
                 let msg = [&msg[..16], &payload[16..]].concat();
-                let out = seal_det(&cfg, WgPacketType::Data, &msg, &mut 500, &mut rng).unwrap();
+                let out = seal_det(&cfg, WgPacketType::Data, &msg, 500, &mut rng).unwrap();
                 assert!(
                     !unpatched_peer_takes_it_for_a_handshake(&cfg, &out[0]),
                     "emitted a datagram an unpatched peer would drop as a handshake"
@@ -685,6 +713,17 @@ mod tests {
         }
     }
 
+    /// An unvalidated config whose prefix cannot hold the header-protection
+    /// nonce is caught at construction, not on the transport send path.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "S1..S4 >= 12")]
+    fn new_rejects_short_prefix_with_header_protection() {
+        let mut cfg = awg_cfg(true, false);
+        cfg.padding.s4 = 11;
+        let _ = Obfuscator::new(Arc::new(cfg));
+    }
+
     #[test]
     fn seal_refuses_oversized_datagram() {
         let mut cfg = awg_cfg(false, true);
@@ -700,7 +739,7 @@ mod tests {
         let mut out = Vec::new();
         let r = Obfuscator::new(Arc::new(cfg.clone())).seal_with(
             wg(WgPacketType::HandshakeInit, &msg),
-            &mut 500,
+            500,
             &mut out,
             &mut rng,
             NOW,
@@ -717,20 +756,18 @@ mod tests {
             WgHandshakeInit::LEN,
             &mut rng,
         );
-        let r = seal_det(&cfg, WgPacketType::HandshakeInit, &msg, &mut 500, &mut rng);
+        let r = seal_det(&cfg, WgPacketType::HandshakeInit, &msg, 500, &mut rng);
         assert_eq!(r.err(), Some(SealError::TooLarge));
 
         // Transport: S4 + 32 is the whole datagram; one byte over is refused.
         let mut cfg = awg_cfg(false, false);
         let msg = message(&cfg, WgPacketType::Data, WgData::OVERHEAD, &mut rng);
         cfg.padding.s4 = (MAX_DATAGRAM_LEN - WgData::OVERHEAD) as u16;
-        let out = seal_det(&cfg, WgPacketType::Data, &msg, &mut 500, &mut rng).unwrap();
+        let out = seal_det(&cfg, WgPacketType::Data, &msg, 500, &mut rng).unwrap();
         assert_eq!(out[0].len(), MAX_DATAGRAM_LEN);
         cfg.padding.s4 += 1;
-        let mut window = 500;
-        let r = seal_det(&cfg, WgPacketType::Data, &msg, &mut window, &mut rng);
+        let r = seal_det(&cfg, WgPacketType::Data, &msg, 500, &mut rng);
         assert_eq!(r.err(), Some(SealError::TooLarge));
-        assert_eq!(window, 500);
     }
 
     /// amneziawg-go's receive-side keystream use: XOR the type field with the
@@ -787,7 +824,7 @@ mod tests {
             ),
         ] {
             let msg = message(&cfg, kind, len, &mut rng);
-            let out = seal_det(&cfg, kind, &msg, &mut 500, &mut rng).unwrap();
+            let out = seal_det(&cfg, kind, &msg, 500, &mut rng).unwrap();
             let datagram = out.last().unwrap();
             let decrypted = go_style_decrypt(&key, datagram, 16, n);
 
