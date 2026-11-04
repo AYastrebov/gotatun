@@ -841,6 +841,7 @@ dependencies = [
  "rand",
  "rand_chacha",
  "rand_core 0.6.4",
+ "sha2",
  "socket2",
  "test-log",
  "thiserror 1.0.69",

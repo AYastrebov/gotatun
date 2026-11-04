@@ -523,16 +523,7 @@ fn a_directly_edited_config_is_validated_by_the_codec() {
     assert!(PhobosCodec::new(c).is_err());
 }
 
-#[cfg(feature = "aws-lc-rs")]
 fn sha256(data: &[u8]) -> Vec<u8> {
-    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, data)
-        .as_ref()
-        .to_vec()
-}
-
-#[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
-fn sha256(data: &[u8]) -> Vec<u8> {
-    ring::digest::digest(&ring::digest::SHA256, data)
-        .as_ref()
-        .to_vec()
+    use sha2::Digest;
+    sha2::Sha256::digest(data).to_vec()
 }

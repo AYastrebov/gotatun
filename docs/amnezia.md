@@ -314,10 +314,13 @@ is most likely to conflict:
 * `device/tests/mock.rs`: `device_pair` is re-indented around a builder hook
   (`device_pair_with`).
 * `udp/channel.rs`: the mock channel's flow-label fix is active with the features off too.
+* `gotatun-packet` (upstream split the packet types into this crate): `wg.rs` gains cfg-gated
+  `set_wire_type` methods and `Packet::try_into_wg_as`, behind that crate's own `amnezia`
+  feature, which `gotatun`'s `amnezia` feature enables.
 
 ## Throughput
 
-The existing `throughput_benches` and `crypto_benches` never touch `Tunn` or the device path, so
+The existing throughput bench (`gotatun/benches/main.rs`) and the `gotatun-crypto` benches never touch `Tunn` or the device path, so
 they cannot show the cost of compiling `amnezia` in. `cargo bench -p gotatun --bench tunn_benches`
 does: it completes a handshake between two `Tunn`s and loops encapsulate + decapsulate of a
 1400-byte IPv4 packet (`Tunn::handle_outgoing_packet` and `handle_incoming_packet`, no TUN MTU,

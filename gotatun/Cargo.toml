@@ -71,6 +71,8 @@ x25519-dalek = {
 zerocopy = { workspace = true, features = ["derive", "std"] }
 
 [dev-dependencies]
+# SHA-256 for the Phobos conformance vectors; already in the dependency graph.
+sha2 = "0.10"
 criterion = { workspace = true, features = ["html_reports"] }
 etherparse = { workspace = true }
 gotatun = { workspace = true, features = ["socket"] }
@@ -131,6 +133,6 @@ tun = ["dep:tun", "dep:wintun-bindings"]
 # In some cases it fails to return UDP_COALESCED_INFO
 windows-gro = []
 # AmneziaWG 2.0/3.0/3.1 obfuscation. Off by default.
-amnezia = ["dep:chacha20"]
+amnezia = ["dep:chacha20", "gotatun-packet/amnezia"]
 # Phobos obfuscation. Off by default.
 phobos = ["device"]

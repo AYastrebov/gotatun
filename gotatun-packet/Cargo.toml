@@ -29,3 +29,6 @@ zerocopy = { workspace = true, features = ["derive"] }
 [features]
 default = ["pool"]
 pool = []
+# Lets the WireGuard packet types carry AmneziaWG header values (used by the
+# `gotatun` crate's `amnezia` feature).
+amnezia = []
