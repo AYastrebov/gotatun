@@ -88,6 +88,44 @@ fn max_attempts_bounds_retries() {
     assert_eq!(gave_up_at, Duration::from_secs(15));
 }
 
+/// Changing only the keepalive range mid-handshake keeps the handshake's
+/// give-up budget drawn from `max_handshake_attempts`; it must not fall back
+/// to the 90 s WireGuard constant.
+#[test]
+#[cfg(feature = "mock_instant")]
+fn keepalive_range_update_keeps_handshake_budget() {
+    let (mut mine, _theirs) = two_tuns();
+    mine.dangerously_set_timer_params(TimerParams {
+        rekey_timeout: secs(5, 5),
+        ..TimerParams::default()
+    });
+    let extras = TimerExtras {
+        max_handshake_attempts: Some(3..=3),
+        ..TimerExtras::default()
+    };
+    mine.set_timer_extras(extras.clone());
+    mine.format_handshake_initiation(false).expect("init");
+
+    // Mid-handshake, a peer update touches only the keepalive range.
+    MockClock::advance(Duration::from_secs(1));
+    mine.set_timer_extras(TimerExtras {
+        persistent_keepalive: Some(secs(20, 30)),
+        ..extras
+    });
+
+    let mut elapsed = Duration::from_secs(1);
+    let gave_up_at = loop {
+        MockClock::advance(Duration::from_secs(1));
+        elapsed += Duration::from_secs(1);
+        match mine.update_timers() {
+            Err(WireGuardError::ConnectionExpired) => break elapsed,
+            Ok(_) => assert!(elapsed < REKEY_ATTEMPT_TIME, "fell back to the 90 s budget"),
+            Err(e) => panic!("unexpected error {e:?}"),
+        }
+    };
+    assert_eq!(gave_up_at, Duration::from_secs(15));
+}
+
 /// Key expiry follows `Hi(reject_after_time)`, not the 180 s constant.
 #[test]
 #[cfg(feature = "mock_instant")]
