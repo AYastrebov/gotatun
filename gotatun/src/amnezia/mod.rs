@@ -11,6 +11,9 @@ pub(crate) mod junk;
 pub(crate) mod rng;
 #[allow(dead_code)]
 pub(crate) mod seal;
+// Wired into peer creation by later tasks; only tests reach it yet.
+#[allow(dead_code)]
+pub(crate) mod timers;
 #[allow(dead_code)]
 pub(crate) mod tunn_state;
 
