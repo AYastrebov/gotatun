@@ -50,6 +50,9 @@ pub struct DeviceBuilder<Udp, TunTx, TunRx> {
 
     #[cfg(target_os = "linux")]
     fwmark: Option<u32>,
+
+    #[cfg(feature = "amnezia")]
+    amnezia: Option<crate::amnezia::AmneziaConfig>,
 }
 
 impl Default for DeviceBuilder<Nul, Nul, Nul> {
@@ -84,6 +87,8 @@ impl DeviceBuilder<Nul, Nul, Nul> {
             suspended: false,
             #[cfg(target_os = "linux")]
             fwmark: None,
+            #[cfg(feature = "amnezia")]
+            amnezia: None,
         }
     }
 }
@@ -111,6 +116,8 @@ impl<X, Y> DeviceBuilder<Nul, X, Y> {
             suspended: self.suspended,
             #[cfg(target_os = "linux")]
             fwmark: self.fwmark,
+            #[cfg(feature = "amnezia")]
+            amnezia: self.amnezia,
         }
     }
 }
@@ -187,6 +194,8 @@ impl<X> DeviceBuilder<X, Nul, Nul> {
             suspended: self.suspended,
             #[cfg(target_os = "linux")]
             fwmark: self.fwmark,
+            #[cfg(feature = "amnezia")]
+            amnezia: self.amnezia,
         }
     }
 }
@@ -254,6 +263,17 @@ impl<X, Y, Z> DeviceBuilder<X, Y, Z> {
         self.fwmark = Some(fwmark);
         self
     }
+
+    /// Obfuscate all traffic with AmneziaWG, applied to every peer.
+    ///
+    /// [`build`](DeviceBuilder::build) validates `cfg` and fails with
+    /// [`Error::Amnezia`] if it is invalid. A config equal to
+    /// `AmneziaConfig::default()` is plain WireGuard.
+    #[cfg(feature = "amnezia")]
+    pub fn with_amnezia(mut self, cfg: crate::amnezia::AmneziaConfig) -> Self {
+        self.amnezia = Some(cfg);
+        self
+    }
 }
 
 impl<Udp: UdpTransportFactory, TunTx: IpSend, TunRx: IpRecv> DeviceBuilder<Udp, TunTx, TunRx> {
@@ -267,8 +287,14 @@ impl<Udp: UdpTransportFactory, TunTx: IpSend, TunRx: IpRecv> DeviceBuilder<Udp, 
     /// Errors if multiple peers have the same public key.
     /// Errors if the UDP socket cannot be bound.
     #[cfg_attr(feature = "daita", doc = "Errors if DAITA initialization fails.")]
+    #[cfg_attr(
+        feature = "amnezia",
+        doc = "Errors if the AmneziaWG configuration is invalid."
+    )]
     pub async fn build(self) -> Result<Device<(Udp, TunTx, TunRx)>, Error> {
         validate_peers(&self.peers)?;
+        #[cfg(feature = "amnezia")]
+        let amnezia = super::amnezia::DeviceAmnezia::from_config(self.amnezia)?;
 
         #[cfg(target_os = "linux")]
         let fwmark = self.fwmark;
@@ -288,6 +314,8 @@ impl<Udp: UdpTransportFactory, TunTx: IpSend, TunRx: IpRecv> DeviceBuilder<Udp, 
             peers_by_idx: parking_lot::Mutex::new(Default::default()),
             peers_by_ip: AllowedIps::new(),
             rate_limiter: None,
+            #[cfg(feature = "amnezia")]
+            amnezia,
             port: self.port,
             connection: None,
             suspended: self.suspended,

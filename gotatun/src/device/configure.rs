@@ -161,6 +161,12 @@ impl<T: DeviceTransports> DeviceRead<'_, T> {
         self.device.fwmark
     }
 
+    /// Return the device's AmneziaWG configuration, `None` for plain WireGuard.
+    #[cfg(feature = "amnezia")]
+    pub fn amnezia(&self) -> Option<crate::amnezia::AmneziaConfig> {
+        self.device.amnezia_config()
+    }
+
     /// Return all peers on the device
     pub async fn peers(&self) -> Vec<PeerStats> {
         let mut peers = vec![];
@@ -214,6 +220,27 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
     /// Change the private key of the device.
     pub async fn set_private_key(&mut self, private_key: StaticSecret) {
         self.reconfigure |= self.device.set_key(private_key).await;
+    }
+
+    /// Set (`Some`) or remove (`None`) the device's AmneziaWG configuration.
+    ///
+    /// The config is validated first; on error nothing changes. Otherwise every
+    /// peer's tunnel is rebuilt, keeping its keys, endpoint and explicit timer
+    /// params, so each peer handshakes again under the new config. Setting the
+    /// current config again is a no-op.
+    #[cfg(feature = "amnezia")]
+    pub async fn set_amnezia(
+        &mut self,
+        cfg: Option<crate::amnezia::AmneziaConfig>,
+    ) -> Result<(), crate::amnezia::ConfigError> {
+        self.reconfigure |= self.device.set_amnezia(cfg).await?;
+        Ok(())
+    }
+
+    /// Return the device's AmneziaWG configuration, `None` for plain WireGuard.
+    #[cfg(feature = "amnezia")]
+    pub fn amnezia(&self) -> Option<crate::amnezia::AmneziaConfig> {
+        self.as_configurator().amnezia()
     }
 
     /// Remove all peers, returning the number of peers removed.
@@ -342,12 +369,20 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
         }
 
         if let Update::Set(timer_params) = timer_params {
+            #[cfg(feature = "amnezia")]
+            let timer_params = self
+                .device
+                .amnezia_timer_params(&mut existing_peer, timer_params);
             existing_peer
                 .tunnel
                 .dangerously_set_timer_params(timer_params.unwrap_or_default());
         }
 
         if let Update::Set(addr) = endpoint {
+            #[cfg(feature = "amnezia")]
+            if existing_peer.endpoint.addr != addr {
+                existing_peer.tunnel.reset_amnezia_udp_window();
+            }
             existing_peer.endpoint.addr = addr;
         }
 

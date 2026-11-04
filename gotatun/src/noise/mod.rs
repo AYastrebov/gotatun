@@ -564,6 +564,7 @@ fn amnezia_pad_transport(
     (packet, is_keepalive)
 }
 
+#[cfg_attr(not(feature = "device"), allow(dead_code))] // Only the device calls these.
 #[cfg(feature = "amnezia")]
 impl<R: RngCore + Send> Tunn<R> {
     /// With AWG padding on, record the TUN MTU for it and return `None`, so
@@ -597,7 +598,6 @@ impl<R: RngCore + Send> Tunn<R> {
     ///
     /// Handshakes formatted afterwards carry H1/H2 type values, chosen before
     /// their MACs are computed.
-    #[allow(dead_code)] // Called by the device when it builds peer tunnels.
     pub(crate) fn set_amnezia(&mut self, state: Option<AmneziaTunnState>) {
         self.handshake
             .set_wire_types(state.as_ref().map(AmneziaTunnState::wire_types));
@@ -606,14 +606,12 @@ impl<R: RngCore + Send> Tunn<R> {
 
     /// This tunnel's AmneziaWG UDP window (`None` for plain WireGuard), the
     /// single source of truth the send boundary sizes trailers against.
-    #[allow(dead_code)] // Called by the device send path.
     pub(crate) fn amnezia_udp_window_mut(&mut self) -> Option<&mut usize> {
         self.amnezia.as_mut().map(AmneziaTunnState::udp_window_mut)
     }
 
     /// Widen the UDP window to cover a received transport datagram of `size`
     /// bytes (amneziawg-go `receive.go:517-520`). No-op for plain WireGuard.
-    #[allow(dead_code)] // Called by the device receive path.
     pub(crate) fn widen_amnezia_udp_window(&mut self, size: usize) {
         if let Some(state) = self.amnezia.as_mut() {
             state.widen_udp_window(size);
@@ -621,7 +619,6 @@ impl<R: RngCore + Send> Tunn<R> {
     }
 
     /// Reset the UDP window to its starting 500 bytes, on endpoint change.
-    #[allow(dead_code)] // Called by the device when a peer's endpoint changes.
     pub(crate) fn reset_amnezia_udp_window(&mut self) {
         if let Some(state) = self.amnezia.as_mut() {
             state.reset_udp_window();

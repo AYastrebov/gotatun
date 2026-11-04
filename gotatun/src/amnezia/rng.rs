@@ -32,6 +32,9 @@ pub(crate) trait RandomSource {
 }
 
 /// Random source backed by the OS CSPRNG (one syscall per draw).
+// No production consumer: AmneziaWG has no long-lived secrets of its own, and
+// no remaining task (10-13) adds one. Kept for spec item 17; tests use it.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OsRandom;
 

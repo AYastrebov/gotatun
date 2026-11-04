@@ -235,7 +235,7 @@ impl RateLimiter {
 }
 
 #[cfg(feature = "amnezia")]
-#[allow(dead_code)] // Consumed by later AmneziaWG tasks; only tests use it yet.
+#[cfg_attr(not(feature = "device"), allow(dead_code))] // Only the device calls these.
 impl RateLimiter {
     /// Like [`RateLimiter::verify_packet`], for a packet already classified by
     /// the AmneziaWG deobfuscator as `kind`.

@@ -401,7 +401,6 @@ impl Default for WgHandshakeInit {
 }
 
 #[cfg(feature = "amnezia")]
-#[allow(dead_code)] // Consumed by later AmneziaWG tasks; only tests use it yet.
 impl WgHandshakeInit {
     /// Overwrite the 4-byte little-endian type field (`packet_type` plus the
     /// reserved bytes) with `v`. AmneziaWG carries its H values here.
@@ -486,7 +485,6 @@ impl WgHandshakeBase for WgHandshakeResp {
 }
 
 #[cfg(feature = "amnezia")]
-#[allow(dead_code)] // Consumed by later AmneziaWG tasks; only tests use it yet.
 impl WgHandshakeResp {
     /// Overwrite the 4-byte little-endian type field (`packet_type` plus the
     /// reserved bytes) with `v`. AmneziaWG carries its H values here.
@@ -571,7 +569,7 @@ impl Packet {
 }
 
 #[cfg(feature = "amnezia")]
-#[allow(dead_code)] // Consumed by later AmneziaWG tasks; only tests use it yet.
+#[cfg_attr(not(feature = "device"), allow(dead_code))] // Only the device calls these.
 impl Packet {
     /// Cast to a WireGuard packet of an already classified `kind`.
     ///

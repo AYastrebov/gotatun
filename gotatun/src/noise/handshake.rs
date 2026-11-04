@@ -944,6 +944,7 @@ impl Handshake {
 }
 
 #[cfg(feature = "amnezia")]
+#[cfg_attr(not(feature = "device"), allow(dead_code))] // Only the device calls these.
 impl Handshake {
     /// Use `wire_types` for the type field of handshakes formatted from now on.
     pub(crate) fn set_wire_types(&mut self, wire_types: Option<WireTypes>) {
