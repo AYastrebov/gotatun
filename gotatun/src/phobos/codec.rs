@@ -101,6 +101,7 @@ const MEDIA_PRESETS: [(u8, u16); 50] = [
 
 /// The cover protocol a datagram is framed in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Masking {
     /// No frame and no control traffic.
     #[default]
@@ -167,6 +168,7 @@ impl Masking {
 
 /// RTP stream parameters for [`Masking::Media`]. Zero means "pick at random".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct MediaParams {
     /// RTP payload type, 0–127. Enforced on receive when non-zero.
     pub payload_type: u8,
@@ -416,7 +418,7 @@ fn crc32(data: &[u8]) -> u32 {
 /// # Panics
 /// If `key` is empty or longer than [`MAX_KEY_LEN`]. A [`PhobosConfig`]
 /// never holds such a key.
-pub fn apply_keystream(buf: &mut [u8], key: &[u8]) {
+pub(crate) fn apply_keystream(buf: &mut [u8], key: &[u8]) {
     assert!(!key.is_empty() && key.len() <= MAX_KEY_LEN);
     // Truncating casts are the specification: `(n + k) mod 256`.
     let base = buf.len().wrapping_add(key.len()) as u8;
@@ -496,7 +498,7 @@ fn encode(
 ///
 /// A payload that unmasks to something already plain is returned whole: the
 /// sender never encoded it. This mirrors the reference.
-pub fn decode(payload: &mut [u8], key: &[u8], obfuscate_bytes: u32) -> Option<usize> {
+pub(crate) fn decode(payload: &mut [u8], key: &[u8], obfuscate_bytes: u32) -> Option<usize> {
     let len = payload.len();
     if len < 4 {
         return None;
