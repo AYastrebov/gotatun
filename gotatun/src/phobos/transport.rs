@@ -41,8 +41,12 @@ struct Shared {
     /// The codec and a scratch buffer to wrap into. Locked for one wrap or
     /// unwrap, never across an `await`.
     codec: Mutex<CodecState>,
-    /// The newest generation handed out by `bind`. 0 before the first bind.
+    /// The newest generation: bumped by every `bind` and by
+    /// [`PhobosHandle::address_changed`]. 0 before the first bind.
     generation: AtomicU64,
+    /// The generation the newest `bind` started. A send half bound then is
+    /// the current socket; any other is an old one being torn down.
+    bound: AtomicU64,
     /// The newest generation an initiation has been sent on successfully.
     initiated: AtomicU64,
     /// The newest generation an initiation has been handed to the socket on,
@@ -96,10 +100,26 @@ pub struct PhobosHandle(Arc<Shared>);
 
 impl PhobosHandle {
     /// Whether the transport needs a handshake initiation sent: a new socket
-    /// was bound, or a datagram was dropped because the current one has not
-    /// carried an initiation yet. Clears the request.
+    /// was bound, [`address_changed`](Self::address_changed) was called, an
+    /// initiation failed to send, or a datagram was dropped before any
+    /// initiation was tried on the current address. Clears the request.
     pub fn take_initiation_request(&self) -> bool {
         self.0.needs_initiation.swap(false, Ordering::AcqRel)
+    }
+
+    /// Report that the local address or path changed without a new
+    /// [`bind`](UdpTransportFactory::bind): a route change, a NAT rebinding,
+    /// or an embedder switching the socket's path underneath the factory.
+    ///
+    /// The Phobos server sees a new source address and drops everything
+    /// from it but a handshake initiation. So this starts a new generation:
+    /// the current socket's gate closes until an initiation has been sent on
+    /// it, and the device is asked for one. An embedder whose transport can
+    /// change its local address or path without rebinding must call this
+    /// whenever it does.
+    pub fn address_changed(&self) {
+        self.0.generation.fetch_add(1, Ordering::AcqRel);
+        self.0.request_initiation();
     }
 }
 
@@ -128,8 +148,12 @@ impl std::fmt::Debug for PhobosHandle {
 /// sent before the initiation would only be dropped, and a keepalive would
 /// not repair the path the way it does for plain WireGuard.
 ///
-/// So every [`bind`](UdpTransportFactory::bind) starts a new *generation*.
-/// A send half belongs to the generation it was bound in. Until a handshake
+/// So every [`bind`](UdpTransportFactory::bind) starts a new *generation*,
+/// and so does [`PhobosHandle::address_changed`], which an embedder must call
+/// when the local address or path changes without a bind. The newest
+/// socket's send half is in the newest generation; an older one stays in the
+/// generation it was bound in, so an initiation it still sends cannot open
+/// the gate for the new address. Until a handshake
 /// initiation has been sent *successfully* on that generation, every other
 /// WireGuard datagram on it is dropped (and reported as sent, which is what
 /// the server would have done with it). The bind raises a "needs initiation"
@@ -182,6 +206,7 @@ impl<F: UdpTransportFactory> PhobosUdpFactory<F> {
             generation: AtomicU64::new(0),
             initiated: AtomicU64::new(0),
             attempted: AtomicU64::new(0),
+            bound: AtomicU64::new(0),
             needs_initiation: AtomicBool::new(false),
             last_handshake: Mutex::new(None),
             last_destination: Mutex::new(None),
@@ -204,13 +229,6 @@ impl<F: UdpTransportFactory> PhobosUdpFactory<F> {
     pub fn inner_mut(&mut self) -> &mut F {
         &mut self.inner
     }
-
-    /// Run the control traffic every `interval` instead, for tests.
-    #[cfg(all(test, feature = "mock_instant"))]
-    fn with_control_interval(mut self, interval: Duration) -> Self {
-        self.control_interval = Some(interval);
-        self
-    }
 }
 
 impl<F: UdpTransportFactory> UdpTransportFactory for PhobosUdpFactory<F> {
@@ -223,12 +241,13 @@ impl<F: UdpTransportFactory> UdpTransportFactory for PhobosUdpFactory<F> {
     ) -> io::Result<(Self::Send, Self::Recv)> {
         let (tx, rx) = self.inner.bind(params).await?;
         let generation = self.shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.shared.bound.store(generation, Ordering::Release);
         self.shared.request_initiation();
 
         let send = PhobosUdpSend {
             inner: tx.clone(),
             shared: Arc::clone(&self.shared),
-            generation,
+            bound_at: generation,
         };
         let control = self
             .control_interval
@@ -244,31 +263,52 @@ impl<F: UdpTransportFactory> UdpTransportFactory for PhobosUdpFactory<F> {
     }
 }
 
-/// Send a Binding Request every `interval` on `send`'s socket while it is the
-/// newest, its gate is open and the session is recent. Stopped by dropping
-/// the receive half that owns it.
+/// Send a Binding Request every `interval` on `send`'s socket. See
+/// [`control_tick`]. Stopped by dropping the receive half that owns it.
 async fn control_loop<S: UdpSend>(send: PhobosUdpSend<S>, interval: Duration) {
-    let shared = &send.shared;
     loop {
         tokio::time::sleep(interval).await;
-        if shared.generation.load(Ordering::Acquire) != send.generation {
+        if control_tick(&send).await == ControlTick::Stop {
             return;
         }
-        if shared.gate_closed(send.generation) || !shared.session_recent() {
-            continue;
-        }
-        let Some(destination) = *shared.last_destination.lock() else {
-            continue;
-        };
-        let request = shared.codec.lock().codec.binding_request();
-        if let Err(e) = send
-            .inner
-            .send_to(Packet::copy_from(&request[..]), destination)
-            .await
-        {
-            tracing::debug!("Phobos binding request send failed: {e}");
-        }
     }
+}
+
+/// What one [`control_tick`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlTick {
+    /// The socket is no longer the newest: the loop ends.
+    Stop,
+    /// Nothing to send: the gate is shut, the session is stale, or nothing
+    /// has been sent yet.
+    Skip,
+    /// A Binding Request went out (or its send failed, which is only logged).
+    Sent,
+}
+
+/// Send one Binding Request on `send`'s socket if it is the newest, its gate
+/// is open and the newest handshake response is under
+/// [`CONTROL_SESSION_WINDOW`] old.
+async fn control_tick<S: UdpSend>(send: &PhobosUdpSend<S>) -> ControlTick {
+    let shared = &send.shared;
+    if !send.is_current() {
+        return ControlTick::Stop;
+    }
+    if shared.gate_closed(send.generation()) || !shared.session_recent() {
+        return ControlTick::Skip;
+    }
+    let Some(destination) = *shared.last_destination.lock() else {
+        return ControlTick::Skip;
+    };
+    let request = shared.codec.lock().codec.binding_request();
+    if let Err(e) = send
+        .inner
+        .send_to(Packet::copy_from(&request[..]), destination)
+        .await
+    {
+        tracing::debug!("Phobos binding request send failed: {e}");
+    }
+    ControlTick::Sent
 }
 
 /// The send half of a [`PhobosUdpFactory`] socket.
@@ -276,15 +316,34 @@ async fn control_loop<S: UdpSend>(send: PhobosUdpSend<S>, interval: Duration) {
 pub struct PhobosUdpSend<S> {
     inner: S,
     shared: Arc<Shared>,
-    /// The bind this socket came from.
-    generation: u64,
+    /// The generation the bind of this socket started.
+    bound_at: u64,
 }
 
 impl<S> std::fmt::Debug for PhobosUdpSend<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PhobosUdpSend")
-            .field("generation", &self.generation)
+            .field("bound_at", &self.bound_at)
             .finish_non_exhaustive()
+    }
+}
+
+impl<S> PhobosUdpSend<S> {
+    /// Whether this is the newest bound socket.
+    fn is_current(&self) -> bool {
+        self.shared.bound.load(Ordering::Acquire) == self.bound_at
+    }
+
+    /// The generation this socket's datagrams belong to: the shared one for
+    /// the newest socket, so an address change gates it too, and its own
+    /// bind's for an older one, so its initiations never open the gate for
+    /// a newer address.
+    fn generation(&self) -> u64 {
+        if self.is_current() {
+            self.shared.generation.load(Ordering::Acquire)
+        } else {
+            self.bound_at
+        }
     }
 }
 
@@ -293,13 +352,16 @@ impl<S: UdpSend> UdpSend for PhobosUdpSend<S> {
 
     async fn send_to(&self, mut packet: Packet, destination: SocketAddr) -> io::Result<()> {
         let initiation = has_type(&packet, HANDSHAKE_INITIATION);
-        if !initiation && self.shared.gate_closed(self.generation) {
+        // Read once: an address change during this send starts a generation
+        // this initiation was not sent for.
+        let generation = self.generation();
+        if !initiation && self.shared.gate_closed(generation) {
             tracing::trace!(
                 "Phobos: dropping a {}-byte datagram until a handshake initiation \
                  has gone out on the new socket",
                 packet.len()
             );
-            if self.shared.attempted.load(Ordering::Acquire) < self.generation {
+            if self.shared.attempted.load(Ordering::Acquire) < generation {
                 self.shared.request_initiation();
             }
             return Ok(());
@@ -334,16 +396,22 @@ impl<S: UdpSend> UdpSend for PhobosUdpSend<S> {
             tracing::debug!("Phobos binding request send failed: {e}");
         }
         if initiation {
+            // One is in flight for this generation: a request raised before
+            // it (by the bind, or a drop) is answered, so the device does not
+            // force a second one.
             self.shared
                 .attempted
-                .fetch_max(self.generation, Ordering::AcqRel);
+                .fetch_max(generation, Ordering::AcqRel);
+            if self.shared.generation.load(Ordering::Acquire) == generation {
+                self.shared.needs_initiation.store(false, Ordering::Release);
+            }
         }
         let sent = self.inner.send_to(packet, destination).await;
         if initiation {
             if sent.is_ok() {
                 self.shared
                     .initiated
-                    .fetch_max(self.generation, Ordering::AcqRel);
+                    .fetch_max(generation, Ordering::AcqRel);
             } else {
                 self.shared.request_initiation();
             }
@@ -362,7 +430,7 @@ impl<S: UdpSend> UdpSend for PhobosUdpSend<S> {
     ) -> io::Result<()> {
         // While the gate is shut, one at a time: an initiation opens it only
         // once its own send has succeeded.
-        if self.shared.gate_closed(self.generation) {
+        if self.shared.gate_closed(self.generation()) {
             for (packet, destination) in packets.drain(..) {
                 self.send_to(packet, destination).await?;
             }
@@ -396,9 +464,24 @@ impl<S: UdpSend> UdpSend for PhobosUdpSend<S> {
                 }
             }
         }
-        // On failure, whatever is left is dropped rather than handed back:
-        // it is already wrapped, and a retry through here would wrap it again.
-        self.inner.send_many_to(send_buf, &mut wrapped).await
+        // Preambles can push the batch past the inner sender's limit, so it
+        // goes out in chunks of at most that many, in order. On failure,
+        // whatever is left is dropped rather than handed back: it is already
+        // wrapped, and a retry through here would wrap it again.
+        let max = self.inner.max_number_of_packets_to_send().max(1);
+        if wrapped.len() <= max {
+            return self.inner.send_many_to(send_buf, &mut wrapped).await;
+        }
+        let mut rest = wrapped.into_iter();
+        let mut chunk = Vec::with_capacity(max);
+        loop {
+            chunk.clear();
+            chunk.extend(rest.by_ref().take(max));
+            if chunk.is_empty() {
+                return Ok(());
+            }
+            self.inner.send_many_to(send_buf, &mut chunk).await?;
+        }
     }
 
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
@@ -611,6 +694,7 @@ pub(crate) mod testing {
         net: Net,
         ip: IpAddr,
         next_port: u16,
+        batch_limit: usize,
     }
 
     impl PipeFactory {
@@ -619,7 +703,15 @@ pub(crate) mod testing {
                 net,
                 ip,
                 next_port: first_port,
+                batch_limit: 1,
             }
+        }
+
+        /// Accept batches of up to `limit` in `send_many_to`, and refuse
+        /// larger ones as a real socket does.
+        pub(crate) fn with_batch_limit(mut self, limit: usize) -> Self {
+            self.batch_limit = limit;
+            self
         }
     }
 
@@ -638,6 +730,7 @@ pub(crate) mod testing {
                 PipeSend {
                     net: self.net.clone(),
                     addr,
+                    batch_limit: self.batch_limit,
                 },
                 PipeRecv(endpoint),
             ))
@@ -648,6 +741,7 @@ pub(crate) mod testing {
     pub(crate) struct PipeSend {
         net: Net,
         addr: SocketAddr,
+        batch_limit: usize,
     }
 
     impl UdpSend for PipeSend {
@@ -658,6 +752,31 @@ pub(crate) mod testing {
                 return Err(io::ErrorKind::NetworkUnreachable.into());
             }
             self.net.deliver(self.addr, destination, &packet);
+            Ok(())
+        }
+
+        fn max_number_of_packets_to_send(&self) -> usize {
+            self.batch_limit
+        }
+
+        async fn send_many_to(
+            &self,
+            _buf: &mut (),
+            packets: &mut Vec<(Packet, SocketAddr)>,
+        ) -> io::Result<()> {
+            if packets.len() > self.batch_limit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{} packets over the limit {}",
+                        packets.len(),
+                        self.batch_limit
+                    ),
+                ));
+            }
+            for (packet, destination) in packets.drain(..) {
+                self.send_to(packet, destination).await?;
+            }
             Ok(())
         }
 
@@ -806,6 +925,17 @@ mod tests {
         assert!(handle.take_initiation_request());
         assert_eq!(read_wire(&mut tap, &mut srv), [], "held back");
 
+        // An initiation the old socket still sends opens nothing on the new.
+        tx1.send_to(wg(1, 148), server()).await.unwrap();
+        assert_eq!(
+            read_wire(&mut tap, &mut srv).len(),
+            2,
+            "old socket: request, init"
+        );
+        tx2.send_to(wg(4, 64), server()).await.unwrap();
+        assert_eq!(read_wire(&mut tap, &mut srv), [], "still held back");
+        let _ = handle.take_initiation_request();
+
         tx2.send_to(wg(1, 148), server()).await.unwrap();
         tx2.send_to(wg(4, 64), server()).await.unwrap();
         assert_eq!(
@@ -893,6 +1023,86 @@ mod tests {
         );
     }
 
+    /// A batch that preambles push past the inner sender's limit goes out in
+    /// chunks, in order, instead of failing whole.
+    #[tokio::test]
+    async fn send_many_respects_the_inner_batch_limit() {
+        let net = Net::default();
+        let mut tap = net.tap();
+        let mut srv = server_codec(Masking::Stun);
+        let pipe = PipeFactory::new(net.clone(), client_ip(), 40000).with_batch_limit(2);
+        let (mut factory, _handle) = PhobosUdpFactory::new(pipe, config(Masking::Stun)).unwrap();
+        let (tx, _rx) = factory.bind(&params()).await.unwrap();
+        let me = tx.local_addr().unwrap().unwrap();
+        assert_eq!(tx.max_number_of_packets_to_send(), 2);
+
+        tx.send_to(wg(1, 148), server()).await.unwrap();
+        let _ = read_wire(&mut tap, &mut srv);
+
+        // Two in, three out: the initiation brings its Binding Request.
+        let mut batch = vec![(wg(4, 64), server()), (wg(1, 148), server())];
+        tx.send_many_to(&mut (), &mut batch).await.unwrap();
+        assert_eq!(
+            read_wire(&mut tap, &mut srv),
+            [
+                (me, Seen::Wg(4)),
+                (me, Seen::BindingRequest),
+                (me, Seen::Wg(1)),
+            ]
+        );
+    }
+
+    /// An address change without a bind closes the current socket's gate
+    /// and asks for an initiation, like a rebind.
+    #[tokio::test]
+    async fn address_change_gates_until_initiation() {
+        let net = Net::default();
+        let mut tap = net.tap();
+        let mut srv = server_codec(Masking::Stun);
+        let (mut factory, handle) = factory_on(&net, Masking::Stun);
+        let (tx, _rx) = factory.bind(&params()).await.unwrap();
+        let me = tx.local_addr().unwrap().unwrap();
+        tx.send_to(wg(1, 148), server()).await.unwrap();
+        tx.send_to(wg(4, 64), server()).await.unwrap();
+        assert_eq!(read_wire(&mut tap, &mut srv).len(), 3);
+        assert!(!handle.take_initiation_request());
+
+        handle.address_changed();
+        assert!(handle.take_initiation_request());
+        tx.send_to(wg(4, 64), server()).await.unwrap();
+        let mut batch = vec![(wg(4, 64), server())];
+        tx.send_many_to(&mut (), &mut batch).await.unwrap();
+        assert_eq!(read_wire(&mut tap, &mut srv), [], "held back");
+        assert!(handle.take_initiation_request(), "no initiation tried yet");
+
+        tx.send_to(wg(1, 148), server()).await.unwrap();
+        tx.send_to(wg(4, 64), server()).await.unwrap();
+        assert_eq!(
+            read_wire(&mut tap, &mut srv),
+            [
+                (me, Seen::BindingRequest),
+                (me, Seen::Wg(1)),
+                (me, Seen::Wg(4)),
+            ]
+        );
+    }
+
+    /// An initiation answers a pending request: the device is not asked to
+    /// force another, and drops after it do not ask again.
+    #[tokio::test]
+    async fn an_initiation_answers_the_request() {
+        let (mut factory, handle) = factory_on(&Net::default(), Masking::Stun);
+        let (tx, _rx) = factory.bind(&params()).await.unwrap();
+        // Not taken: the tunnel sends its own initiation first.
+        tx.send_to(wg(4, 64), server()).await.unwrap();
+        tx.send_to(wg(1, 148), server()).await.unwrap();
+        assert!(!handle.take_initiation_request());
+
+        handle.address_changed();
+        tx.send_to(wg(1, 148), server()).await.unwrap();
+        assert!(!handle.take_initiation_request());
+    }
+
     /// Under every masking, what the server wraps arrives as WireGuard, its
     /// Binding Request is answered on the wire and never delivered.
     #[tokio::test]
@@ -949,35 +1159,39 @@ mod tests {
     }
 
     /// The periodic Binding Request runs only while the newest handshake
-    /// response is under 180 s old, and only on the newest socket.
+    /// response is under 180 s old, and only on the newest socket. Driven
+    /// tick by tick on the mock clock.
     #[cfg(feature = "mock_instant")]
     #[tokio::test]
     async fn binding_request_stops_after_180s_without_handshake() {
         use mock_instant::thread_local::MockClock;
-        use tokio::time::sleep;
 
         let net = Net::default();
         let mut tap = net.tap();
         let srv_ep = net.attach(server());
         let mut srv = server_codec(Masking::Stun);
-        let (factory, _handle) = factory_on(&net, Masking::Stun);
-        let mut factory = factory.with_control_interval(Duration::from_millis(5));
+        let (mut factory, handle) = factory_on(&net, Masking::Stun);
         let (tx, mut rx) = factory.bind(&params()).await.unwrap();
         let me = tx.local_addr().unwrap().unwrap();
 
-        let mut requests = async |tap: &mut UnboundedReceiver<Wire>| {
-            // Let the loop settle on the current clock, then count.
-            sleep(Duration::from_millis(30)).await;
+        let mut tick = async |tx: &PhobosUdpSend<_>, tap: &mut UnboundedReceiver<Wire>| {
             let _ = read_wire(tap, &mut srv);
-            sleep(Duration::from_millis(60)).await;
-            read_wire(tap, &mut srv)
-                .into_iter()
-                .filter(|seen| *seen == (me, Seen::BindingRequest))
-                .count()
+            let step = control_tick(tx).await;
+            let seen = read_wire(tap, &mut srv);
+            match step {
+                ControlTick::Sent => assert_eq!(seen, [(me, Seen::BindingRequest)]),
+                _ => assert_eq!(seen, []),
+            }
+            step
         };
 
+        assert_eq!(tick(&tx, &mut tap).await, ControlTick::Skip, "gate shut");
         tx.send_to(wg(1, 148), server()).await.unwrap();
-        assert_eq!(requests(&mut tap).await, 0, "no handshake seen yet");
+        assert_eq!(
+            tick(&tx, &mut tap).await,
+            ControlTick::Skip,
+            "no handshake yet"
+        );
 
         // The server's response arrives.
         let mut out = Vec::new();
@@ -987,22 +1201,39 @@ mod tests {
         srv_ep.send(&out, me);
         let (packet, _) = rx.recv_from(&mut PacketBufPool::new(1)).await.unwrap();
         assert_eq!(packet[0], 2);
-        assert!(requests(&mut tap).await > 0, "session up");
+        assert_eq!(tick(&tx, &mut tap).await, ControlTick::Sent, "session up");
 
         MockClock::advance(Duration::from_secs(179));
-        assert!(requests(&mut tap).await > 0, "179 s on");
+        assert_eq!(tick(&tx, &mut tap).await, ControlTick::Sent, "179 s on");
 
         MockClock::advance(Duration::from_secs(1));
-        assert_eq!(requests(&mut tap).await, 0, "stopped at 180 s");
+        assert_eq!(
+            tick(&tx, &mut tap).await,
+            ControlTick::Skip,
+            "stopped at 180 s"
+        );
 
         // A response we send counts too: a server-initiated handshake.
         tx.send_to(wg(2, 92), server()).await.unwrap();
-        assert!(requests(&mut tap).await > 0, "restarted");
+        assert_eq!(tick(&tx, &mut tap).await, ControlTick::Sent, "restarted");
 
-        // A rebind stops the old socket's loop, and the new one is gated.
+        // An address change shuts the gate, and with it the control traffic.
+        handle.address_changed();
+        assert_eq!(
+            tick(&tx, &mut tap).await,
+            ControlTick::Skip,
+            "address changed"
+        );
+        tx.send_to(wg(1, 148), server()).await.unwrap();
+        assert_eq!(tick(&tx, &mut tap).await, ControlTick::Sent);
+
+        // A rebind ends the old socket's loop.
         let (tx2, _rx2) = factory.bind(&params()).await.unwrap();
-        drop(rx);
-        assert_eq!(requests(&mut tap).await, 0, "old socket stopped");
-        let _ = tx2;
+        assert_eq!(tick(&tx, &mut tap).await, ControlTick::Stop, "old socket");
+        assert_eq!(
+            tick(&tx2, &mut tap).await,
+            ControlTick::Skip,
+            "new socket gated"
+        );
     }
 }

@@ -20,7 +20,9 @@ use zerocopy::IntoBytes;
 use super::mock::{self, MockAppRx, MockAppTx, MockTun};
 use crate::device::{Device, DeviceBuilder, Peer};
 use crate::phobos::testing::{Net, PipeFactory};
-use crate::phobos::{Masking, PhobosCodec, PhobosConfig, PhobosUdpFactory, Unwrapped};
+use crate::phobos::{
+    Masking, PhobosCodec, PhobosConfig, PhobosHandle, PhobosUdpFactory, Unwrapped,
+};
 
 const CLIENT_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 const UPSTREAM_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
@@ -102,6 +104,7 @@ struct Setup {
     upstream_tx: MockAppTx,
     upstream_rx: MockAppRx,
     dropped: Arc<AtomicUsize>,
+    handle: PhobosHandle,
 }
 
 async fn setup(net: &Net) -> Setup {
@@ -121,7 +124,7 @@ async fn setup(net: &Net) -> Setup {
         .with_private_key(key_c.clone())
         .with_ip(tun_c)
         .with_udp(udp)
-        .with_phobos_handle(handle)
+        .with_phobos_handle(handle.clone())
         .with_peer(
             Peer::new(PublicKey::from(&key_u))
                 .with_endpoint(front())
@@ -152,6 +155,7 @@ async fn setup(net: &Net) -> Setup {
         upstream_tx,
         upstream_rx,
         dropped,
+        handle,
     }
 }
 
@@ -194,20 +198,41 @@ async fn phobos_ping_through_reference_vectors_peer() {
     assert_eq!(s.dropped.load(Ordering::SeqCst), 0);
 }
 
+/// Under `mock_instant` the clock stands still, and an initiation whose
+/// TAI64N timestamp is not newer than the last one is dropped by the upstream
+/// as a replay: move the clock on before asking for a second one.
+fn let_time_pass() {
+    #[cfg(feature = "mock_instant")]
+    mock_instant::thread_local::MockClock::advance(Duration::from_secs(1));
+}
+
+/// Send `payload` until it arrives: what the gate held back before the
+/// initiation went out is lost, as the server would have lost it.
+async fn ping_until_through(tx: &MockAppTx, rx: &mut MockAppRx, payload: &[u8]) {
+    let packet = mock::packet(payload);
+    timeout(Duration::from_secs(5), async {
+        loop {
+            tx.send(packet.clone()).await;
+            if let Ok(got) = timeout(Duration::from_millis(100), rx.recv()).await {
+                assert_eq!(got.as_bytes(), packet.as_bytes());
+                break;
+            }
+        }
+    })
+    .await
+    .expect("no ping got through");
+}
+
 /// After the device rebinds its socket, it starts a handshake on its own,
 /// and the server sees the initiation before anything else from the new
 /// address.
-///
-/// Not under `mock_instant`: with the clock frozen, the second initiation's
-/// timestamp is not newer than the first and the upstream drops it as a
-/// replay.
-#[cfg(not(feature = "mock_instant"))]
 #[tokio::test]
 #[test_log::test]
 async fn phobos_rebind_sends_an_initiation_first() {
     let net = Net::default();
     let mut s = setup(&net).await;
     ping(&s.client_tx, &mut s.upstream_rx, b"before").await;
+    let_time_pass();
 
     let old_port = s.client.read(async |d| d.listen_port()).await;
     s.client
@@ -218,22 +243,42 @@ async fn phobos_rebind_sends_an_initiation_first() {
     assert_ne!(old_port, new_port, "rebound");
 
     // The session is still up, so only the rebind gate's request makes the
-    // device handshake before the next rekey. Data the gate held back before
-    // the initiation went out is lost, as the server would have lost it.
-    let packet = mock::packet(b"after");
-    timeout(Duration::from_secs(5), async {
-        loop {
-            s.client_tx.send(packet.clone()).await;
-            if let Ok(got) = timeout(Duration::from_millis(100), s.upstream_rx.recv()).await {
-                assert_eq!(got.as_bytes(), packet.as_bytes());
-                break;
-            }
-        }
-    })
-    .await
-    .expect("no ping got through after the rebind");
+    // device handshake before the next rekey.
+    ping_until_through(&s.client_tx, &mut s.upstream_rx, b"after").await;
     ping(&s.upstream_tx, &mut s.client_rx, b"back").await;
     assert_eq!(s.dropped.load(Ordering::SeqCst), 0);
+}
+
+/// After the embedder reports an address change without a rebind, the
+/// device handshakes again, and the first WireGuard message the server sees
+/// afterwards is the initiation.
+#[tokio::test]
+#[test_log::test]
+async fn phobos_address_change_sends_an_initiation_first() {
+    let net = Net::default();
+    let mut s = setup(&net).await;
+    ping(&s.client_tx, &mut s.upstream_rx, b"before").await;
+    let_time_pass();
+
+    let mut tap = net.tap();
+    s.handle.address_changed();
+    ping_until_through(&s.client_tx, &mut s.upstream_rx, b"after").await;
+
+    let mut server = PhobosCodec::new(config()).unwrap();
+    let mut types = Vec::new();
+    while let Ok((source, _, mut bytes)) = tap.try_recv() {
+        if source.ip() == IpAddr::V4(CLIENT_IP)
+            && let Unwrapped::WireGuard(message) = server.unwrap(&mut bytes, source)
+        {
+            types.push(message[0]);
+        }
+    }
+    assert_eq!(
+        types.first(),
+        Some(&1),
+        "WireGuard types after the change: {types:?}"
+    );
+    assert!(types.contains(&4), "data went through: {types:?}");
 }
 
 /// AmneziaWG and Phobos cannot be configured together: at build, or later.
