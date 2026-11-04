@@ -2,6 +2,11 @@
 
 A userspace [WireGuard<sup>®</sup>](https://www.wireguard.com/) implementation, and a fork of [BoringTun](https://github.com/cloudflare/boringtun).
 
+This repository is a fork of [Mullvad's GotaTun](https://github.com/mullvad/gotatun) that adds
+AmneziaWG 2.0/3.0/3.1 and the client side of Phobos as optional features, with the upstream code
+paths left unchanged when those features are off. See [Obfuscation](#obfuscation) below and
+[docs/amnezia.md](docs/amnezia.md).
+
 ## License
 
 All source code in this repository is subject to the terms of the Mozilla Public License, version 2.0 unless stated otherwise. A copy of this license can be found in the file "LICENSE" or at <https://www.mozilla.org/MPL/2.0/>.
@@ -15,7 +20,10 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 ## Building
 
 - Library only: `cargo build --lib --no-default-features --release [--target $(TARGET_TRIPLE)]`
+  (add `--features amnezia` and/or `--features phobos` for the obfuscation features; both are
+  off by default in the library)
 - Executable: `cargo build --bin gotatun --release [--target $(TARGET_TRIPLE)]`
+  (the executable enables `amnezia` by default)
 
 ### Installation
 
@@ -32,6 +40,10 @@ As per the specification, to start a tunnel use:
 `gotatun [-f/--foreground] INTERFACE-NAME`
 
 The tunnel can then be configured using [wg](https://git.zx2c4.com/WireGuard/about/src/tools/man/wg.8), as a regular WireGuard tunnel, or any other tool.
+AmneziaWG settings are set over the same socket with the amneziawg-go key names
+(see [UAPI.md](./UAPI.md)), so `awg` from
+[amneziawg-tools](https://github.com/amnezia-vpn/amneziawg-tools) works too;
+[docs/amnezia.md](docs/amnezia.md) has a step-by-step test against a live AmneziaWG server.
 
 It is also possible to use with [wg-quick](https://git.zx2c4.com/WireGuard/about/src/tools/man/wg-quick.8) by setting the environment variable `WG_QUICK_USERSPACE_IMPLEMENTATION` to `gotatun`. For example:
 
@@ -45,6 +57,16 @@ Testing this project has a few requirements:
 
 - `sudo`: required to create tunnels. When you run `cargo test` you'll be prompted for your password.
 - Docker: you can install it [here](https://www.docker.com/get-started). If you are on Ubuntu/Debian you can run `apt-get install docker.io`.
+
+`.cargo/config.toml` runs every test binary under `sudo -E`. The library's unit tests, including
+the AmneziaWG and Phobos device tests, use in-memory transports and do not need root; to run them
+without a password prompt, override the runner for your target, for example
+`CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER=env cargo test -p gotatun --lib --features amnezia,phobos,device`.
+
+CI tests three feature sets: default, `--no-default-features --features ring`, and
+`--all-features`. Because the `gotatun` executable enables `amnezia` by default, the default row
+builds the library with `amnezia` compiled in; the feature-off device path is covered by the
+`ring` row, and Phobos only by `--all-features`.
 
 ## Supported platforms
 
@@ -78,12 +100,24 @@ The behaviour is similar to that of [wireguard-go](https://git.zx2c4.com/wiregua
 
 ## Obfuscation
 
-Two optional features, both off by default (`gotatun-cli` enables `amnezia`):
+Two optional features, both off by default in the library (the `gotatun` executable enables
+`amnezia`):
 
-- `amnezia`: AmneziaWG 2.0, 3.0 and 3.1, interoperable with amneziawg-go.
-- `phobos`: client side of Phobos UDP obfuscation.
+- `amnezia`: AmneziaWG 2.0, 3.0 and 3.1, interoperable with
+  [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) and the AmneziaWG kernel module,
+  in both roles. One config per device, set with `DeviceBuilder::with_amnezia`, changed at run
+  time with `DeviceWrite::set_amnezia` (the sockets are kept), or over UAPI.
+- `phobos` (implies `device`): the client side of
+  [Phobos](https://github.com/Ground-Zerro/Phobos) UDP obfuscation, as a wrapper around any
+  `UdpTransportFactory`. Plain WireGuard only; a device refuses to build with both features
+  configured. Embedders whose local address can change without a rebind must keep the
+  `PhobosHandle` and call `address_changed()`.
 
-See [docs/amnezia.md](docs/amnezia.md) for the wire format, config keys and MTU guidance.
+With `amnezia` compiled in but unconfigured, the `Tunn` hot path measures the same as without it
+(`cargo bench -p gotatun --bench tunn_benches`). One change applies to plain WireGuard in every
+build: the handshake timestamp epoch now matches kernel WireGuard (upstream's ran 27 s ahead).
+See [docs/amnezia.md](docs/amnezia.md) for the wire format, config keys, MTU guidance,
+the differences from amneziawg-go, known limitations, and notes for rebasing on upstream.
 
 ## UAPI extensions
 

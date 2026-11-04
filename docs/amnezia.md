@@ -11,10 +11,10 @@ This document covers the two obfuscation features added on top of GotaTun, both 
   needs bytes 1-3 of every WireGuard message to be zero, which AmneziaWG headers break. The device
   refuses to build with both.
 
-With both features off, upstream code paths compile unchanged. With `amnezia` compiled in but no
-config set, the device is plain WireGuard and skips all Amnezia work on the hot path. One fix
-applies to plain WireGuard too once `amnezia` is compiled in: the handshake timestamp epoch (see
-[Fixes made while porting](#fixes-made-while-porting)).
+With both features off, upstream code paths compile unchanged, with one deliberate exception that
+is a plain-WireGuard bug fix: the handshake timestamp epoch (see
+[Fixes made while porting](#fixes-made-while-porting)). With `amnezia` compiled in but no config
+set, the device is plain WireGuard and skips all Amnezia work on the hot path.
 
 ## AmneziaWG
 
@@ -95,7 +95,7 @@ cfg.validate()?;   // rules that span several keys; with_amnezia/set_amnezia che
 
 // at build time; fails with Error::Amnezia if the config is invalid
 let device = DeviceBuilder::new()
-    .with_amnezia(cfg)
+    .with_amnezia(cfg.clone())
     /* ... */;
 
 // at run time: validate, swap in place, rebuild peer tunnels
@@ -103,6 +103,15 @@ let device = DeviceBuilder::new()
 device.write(async |w| w.set_amnezia(Some(cfg)).await).await??;
 // the first `?` is the device `Error` from `write`, the second the `ConfigError`
 ```
+
+Filling the struct's public fields directly works too. The device normalises zero values the way
+the UAPI parser does (an all-zero `header_protection_key` and a `0` content-padding range mean
+off, a `0` timing range means "WireGuard default", an empty `I` chain is unset) before it
+validates. The standalone `AmneziaConfig::validate()` and `is_plain_wireguard()` do **not**
+normalise yet: a config with `header_protection_key: Some([0; 32])` and an `s` value below 12
+fails `validate()` even though `with_amnezia`/`set_amnezia` accept it and treat it as plain
+WireGuard. Either pass such configs straight to the device, or go through `apply_uapi_line`,
+which already maps zero to `None`. (Tracked under [Known limitations](#known-limitations).)
 
 `set_amnezia` keeps the UDP sockets (an embedder may hand over one pre-bound socket pair that
 cannot be bound twice) and swaps the config in place. Each peer's `Tunn` is rebuilt, keeping its
@@ -173,19 +182,19 @@ Where Go behaviour was copied even though it looks odd:
 * With content padding or random trailers on, the drawn padding replaces WireGuard's 16-byte
   alignment instead of adding to it, so transport payloads are not 16-byte aligned. Go does the
   same (`RoutineEncryption` only pads to 16 when neither is on).
-* Zero values set through the Rust API are read the way the UAPI reads them: an all-zero
-  `header_protection_key` and a `0` content padding range mean off, a `0` timing range means
-  "WireGuard default", and an empty `I` chain is unset.
+* Zero values handed to the device through the Rust API are read the way the UAPI reads them: an
+  all-zero `header_protection_key` and a `0` content padding range mean off, a `0` timing range
+  means "WireGuard default", and an empty `I` chain is unset (see the caveat under
+  [Rust API](#rust-api)).
 
 ### Fixes made while porting
 
 * **Handshake TAI64N epoch.** GotaTun used `2^62 + 37`; the kernel and Go use `2^62 + 10`, so the
-  timestamp ran 27 s ahead. The fix is a compile-time switch on the `amnezia` feature, not on
-  the config: with `amnezia` compiled in (the `gotatun-cli` default, and shoes), it applies to
-  plain WireGuard tunnels as well. Builds without the feature keep the old epoch. After an
-  upgrade, a peer that has already seen the old, 27 s-ahead stamps from this key rejects the new
-  initiations as replays until the clock catches up, for up to 27 s. (This is an upstream bug,
-  to be reported to Mullvad.)
+  timestamp ran 27 s ahead. The fix is unconditional (it is a plain-WireGuard interop bug, and
+  gating it on a feature would make two builds of this crate with the same key stamp 27 s
+  apart). After an upgrade, a peer that has already seen the old, 27 s-ahead stamps from this
+  key rejects the new initiations as replays until the clock catches up, for up to 27 s. The
+  fix is submitted upstream to Mullvad separately.
 * **Mock UDP channel** (tests): the IPv6 flow label could overflow 20 bits (commit `daa7bf9`).
 * **awgtun** (the boringtun fork this port was checked against) had two bugs that are not carried
   over: on its device path, cookie replies lacked the 3.1 trailer (here every cookie reply is
@@ -257,6 +266,31 @@ under 1024 bytes, so large packets are not padded further (the same 1024 cap bou
 of handshake messages). With `Stun` the framed message may not
 exceed `Masking::max_message_len()`.
 
+## Known limitations
+
+Found in review and left as follow-ups; none affects interoperability on the paths `gotatun`
+and the UAPI use.
+
+* `AmneziaConfig::validate()` and `is_plain_wireguard()` do not normalise zero values (see
+  [Rust API](#rust-api)); the device does. Fix: normalise inside both.
+* Phobos: a rebind racing with an initiation still queued on the old socket can, in a window of a
+  few instructions, let that old-socket initiation open the new socket's gate. The server then
+  drops the new address's data until WireGuard's own retry, about 15 s. A correct fix needs the
+  bind and `address_changed()` bumps to be serialised with the senders' generation reads.
+* Phobos: the gate is per socket, not per peer (a Phobos client has one peer, so this is fine),
+  and an `address_changed()` in the middle of a batched send lets the rest of that one batch
+  through.
+* With `random_trailers` off, two message kinds can still be the same size (for example
+  `s1 + 148 == s2 + 92`); the first match wins, as in amneziawg-go. Avoid such `s` values.
+* `set_amnezia` rebuilds each peer's `Tunn` but not its DAITA instance.
+* Every datagram takes a read lock on the shared Amnezia config cell even when nothing is
+  configured. The `Tunn` benchmark cannot see it; a device-level benchmark could.
+* Classifying a trailered transport packet takes one index-table lock per packet, shared with
+  index allocation at handshake time.
+* `DeviceRead::peers()` returns the AmneziaWG-derived timer params as explicit
+  `danger_timer_params` only while no config is set; peers round-tripped through `with_peers`
+  before `set_amnezia(Some(..))` keep those pinned defaults, as upstream semantics require.
+
 ## Rebasing on upstream
 
 New code lives in new files (`amnezia/`, `phobos/`, `device/amnezia.rs`, `device/tests/`, the
@@ -318,12 +352,14 @@ AmneziaWG `.conf` of a working server, root, and `socat`. All values below are p
 2. Start the device (this creates `/var/run/wireguard/awgtest0.sock`):
 
    ```bash
-   sudo WG_SUDO=1 ./target/release/gotatun-cli --disable-drop-privileges \
+   sudo WG_SUDO=1 ./target/release/gotatun --disable-drop-privileges \
        -f -v debug -l /tmp/gotatun.log awgtest0
    ```
 
-   On macOS the interface name is `utun` or `utun<N>`; the real name can be written to a file with
-   `--tun-name-file`, and the socket is named after the interface you passed.
+   (The executable built from the `gotatun-cli` crate is named `gotatun`; it enables the
+   `amnezia` feature by default.) On macOS the interface name is `utun` or `utun<N>`; the real
+   name can be written to a file with `--tun-name-file` (or `WG_TUN_NAME_FILE`), and the socket is
+   named after the interface you passed.
 
 3. Push the config. A template (no real values; `errno=0` is success, `errno=22` means the
    AmneziaWG block was rejected, so check the log):

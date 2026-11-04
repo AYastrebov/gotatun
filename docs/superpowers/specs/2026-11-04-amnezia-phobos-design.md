@@ -1,7 +1,9 @@
 # AmneziaWG 2.0 / 3.0 / 3.1 and Phobos in gotatun — design
 
 Date: 2026-11-04
-Status: approved 2026-11-04
+Status: approved 2026-11-04; implemented on `feat/amnezia-phobos` the same day — see
+[Implementation notes](#implementation-notes) at the end for where the build departed from this
+text, and `docs/amnezia.md` for the user-facing description.
 
 ## Intent
 
@@ -371,3 +373,47 @@ beyond noise vs. the feature off.
   initiation from `Tunn`, as long as ordering on the wire is I1..I5, junk,
   initiation.
 - Order of implementation (2.0 → 3.0 → 3.1 → Phobos is the natural one).
+
+## Implementation notes
+
+Decisions taken during the build that change or sharpen the text above. The wire authority was
+a fresh checkout of amneziawg-go (`b5928ef`); where this document, the plan and Go disagreed, Go
+won unless awgtun's `AMNEZIA.md` documents a deliberate difference.
+
+- **S4 on transport packets is added by one allocation and copy**, not zero-copy headroom:
+  gotatun's `Packet<WgData>` cannot carry headroom without changing public types. The
+  unconfigured path is unaffected (benchmarked in `tunn_benches`).
+- **The UDP window is widened on both send and receive** (Go `send.go` `RoutineEncryption` and
+  `receive.go`), with the pre-padding size on send; `seal` only reads it. Cookie replies always
+  draw their trailer from the fixed 500-byte window, as Go's `device.randomTrailer` does.
+- **An `I` chain that renders to zero bytes is still sent** as an empty datagram (Go sends every
+  non-nil chain).
+- **`max_handshake_attempts` defaults to 18** (Go's `MaxTimerHandshakes`) when only
+  `rekey_timeout` is set, so the give-up time grows with the rekey range; the "only when set"
+  wording above was too narrow.
+- **`set_amnezia` never restarts the connection or rebinds sockets**: shoes hands over one
+  pre-bound socket pair whose `bind()` errors on a second call. The config lives in a shared
+  cell read per packet.
+- **Receive-side recovery of misclassified trailered handshakes** (not in this document): with
+  `random_trailers`, transport-first classification misreads about `width(H4)/2^32` of
+  handshakes as data, and a trailered response can look like an initiation
+  (`width(H1)/2^32`). Both are recovered on receive (idx-miss re-classification; trying the other
+  handshake kinds on MAC1 failure, at most 3 per datagram). This also helps Go senders.
+- **The handshake TAI64N epoch fix** (gotatun used `2^62 + 37`, kernel and Go `2^62 + 10`) was
+  first gated on the `amnezia` cargo feature to keep feature-off builds identical to upstream,
+  then made unconditional: two builds of this crate sharing a key would otherwise stamp 27 s
+  apart. This is the one place a feature-off build differs from Mullvad's, until the fix lands
+  upstream (submitted separately).
+- **Phobos `Masking`** keeps three variants (`None`, `Stun`, `Media`); `auto` and `tls` parse to
+  `None`. A `PhobosHandle::address_changed()` was added for local-address changes without a
+  `bind()` (route change, NAT rebinding, shoes switching Direct/Detour); embedders that need it
+  must wrap their own factory with `PhobosUdpFactory::new` and keep the handle, since
+  `with_phobos` keeps it private.
+- **Timing ranges** extend `TimerParams` through a separate `TimerExtras` (reject-after,
+  max-attempts, receive-side rekey, per-peer keepalive range); `TimerParams` itself is unchanged.
+- **Tests that need upstream's private test helpers** stay declared from inside the upstream test
+  modules (two lines each) but live in sibling files; see "Rebasing on upstream" in
+  `docs/amnezia.md`.
+- **Open follow-up:** `AmneziaConfig::validate()` / `is_plain_wireguard()` do not normalise
+  zero values the way the device does, so a direct Rust-API caller can get a spurious
+  `HeaderProtectionPaddingTooSmall` for an all-zero key. One-line fix.

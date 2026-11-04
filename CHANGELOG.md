@@ -20,13 +20,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add the `tunn_benches` benchmark (1400-byte encapsulate + decapsulate through two `Tunn`s).
   With `amnezia` compiled in and no config it matches the build without it (2.264 us per packet
   in both).
+- Add `Peer::keepalive_range` and the UAPI peer key `persistent_keepalive_interval=a-b`: the
+  persistent keepalive interval is drawn from the range each time it fires (`amnezia`).
+- `DeviceWrite::set_amnezia` swaps the config in place and rebuilds the peer tunnels without
+  rebinding the UDP sockets, so embedders that hand over a single pre-bound socket pair can
+  change it at run time.
+- With `random_trailers`, a handshake whose random prefix makes it look like a transport packet,
+  or a response that looks like an initiation, is re-classified on receive instead of dropped,
+  so such handshakes complete without a retry. amneziawg-go senders benefit too.
+- The `gotatun` executable enables `amnezia` by default.
 - See `docs/amnezia.md`.
 
+### Changed
+- Zero-valued AmneziaWG options passed through the Rust API (an all-zero
+  `header_protection_key`, a `0` content padding range, a `0` timing range) are treated as off
+  by the device, as amneziawg-go and the UAPI parser do. `AmneziaConfig::validate()` on its own
+  does not normalise them yet.
+- `DeviceRead::peers()` no longer reports AmneziaWG-derived timer ranges as explicit
+  `danger_timer_params` while an AmneziaWG config is set, so round-tripping peers does not pin
+  them.
+- Phobos: `PhobosHandle::take_initiation_request` is crate-private, and `Masking`,
+  `MediaParams` and `phobos::ConfigError` are `#[non_exhaustive]`.
+- Phobos answers STUN Binding Requests only from the server it last sent to, not from any
+  address.
+- A failure to build the pre-handshake packets (for example an `I` chain over 65535 bytes) is
+  logged at `warn` once instead of only at `trace`.
+
 ### Fixed
-- With the `amnezia` feature compiled in, the handshake TAI64N timestamp uses the epoch of kernel
-  WireGuard and amneziawg-go (`2^62 + 10`) instead of `2^62 + 37`, which ran 27 seconds ahead.
-  This applies to plain WireGuard tunnels too. After upgrading, a peer that saw the old stamps
-  from the same key rejects initiations as replays for up to 27 seconds.
+- The handshake TAI64N timestamp uses the epoch of kernel WireGuard and wireguard-go
+  (`2^62 + 10`) instead of `2^62 + 37`, which ran 27 seconds ahead. This applies to every build.
+  After upgrading, a peer that saw the old stamps from the same key rejects initiations as
+  replays for up to 27 seconds.
+- A UAPI peer block that gives `persistent_keepalive_interval` both as a range and as a fixed
+  value now takes the last one, in either order, as amneziawg-go does.
+- Changing a peer's keepalive range no longer resets a live handshake's give-up budget or a live
+  session's rekey-on-receive age to the plain WireGuard constants; they are re-drawn only when
+  their own ranges change.
+- A Phobos-forced initiation after a rebind no longer replaces that timer tick's normal
+  processing (keepalives, expiry, retransmits); it is sent only when the tick produced nothing.
 - Fix the mock UDP channel's IPv6 flow label overflowing 20 bits in tests.
 
 
