@@ -613,15 +613,22 @@ impl<R: rand::RngCore + Send> Tunn<R> {
     ///
     /// The device calls this when it builds a peer's `Tunn` (with
     /// `amnezia::timers::timer_extras_from` for the device-wide ranges, plus the
-    /// peer's persistent-keepalive range). The give-up budget and the
-    /// rekey-on-receive age are re-drawn at the next handshake and session. A
-    /// persistent-keepalive range replaces any fixed interval and draws its first
-    /// interval now; removing a range that was set disables persistent keepalive.
+    /// peer's persistent-keepalive range). A live handshake's give-up budget and
+    /// a live session's rekey-on-receive age are re-drawn from the new ranges
+    /// only when those ranges changed; otherwise they keep their drawn values,
+    /// so updating just the keepalive range mid-handshake does not disturb them.
+    /// A persistent-keepalive range replaces any fixed interval and draws its
+    /// first interval now; removing a range that was set disables persistent
+    /// keepalive.
     pub(crate) fn set_timer_extras(&mut self, extras: TimerExtras) {
-        let had_range = self.timers.extras.persistent_keepalive.is_some();
-        self.timers.extras = extras;
-        self.timers.rekey_attempt_time = REKEY_ATTEMPT_TIME;
-        self.timers.rekey_after_receive = REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT;
+        let old = std::mem::replace(&mut self.timers.extras, extras);
+        if old.max_handshake_attempts != self.timers.extras.max_handshake_attempts {
+            self.amnezia_handshake_started();
+        }
+        if old.rekey_after_receive != self.timers.extras.rekey_after_receive {
+            self.amnezia_session_established();
+        }
+        let had_range = old.persistent_keepalive.is_some();
 
         let was_enabled = self.timers.persistent_keepalive.is_some();
         if self.timers.extras.persistent_keepalive.is_some() {
