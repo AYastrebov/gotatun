@@ -30,18 +30,30 @@
 //!   address it has not seen complete a handshake.
 //! - Lower the tunnel MTU by [`Masking::overhead`].
 //!
+//! [`PhobosUdpFactory`] does all of this but the MTU for a
+//! [`Device`](crate::device::Device): it wraps any [`UdpTransportFactory`]
+//! and hands the device a [`PhobosHandle`] through which it asks for the
+//! handshake. See its docs for the rebind gate.
+//!
 //! [`Tunn`]: crate::noise::Tunn
 //! [`Tunn::new`]: crate::noise::Tunn::new
+//! [`UdpTransportFactory`]: crate::udp::UdpTransportFactory
 
 mod codec;
 #[cfg(test)]
 mod test_vectors;
+mod transport;
+#[cfg(test)]
+pub(crate) use transport::testing;
 
 use rand::rngs::OsRng;
 use rand::{RngCore, SeedableRng, TryRngCore};
 use rand_chacha::ChaCha20Rng;
 
 pub use codec::*;
+pub use transport::{
+    CONTROL_SESSION_WINDOW, PhobosHandle, PhobosUdpFactory, PhobosUdpRecv, PhobosUdpSend,
+};
 
 /// A [`PhobosConfig`] field could not be set.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

@@ -290,6 +290,11 @@ impl<T: DeviceTransports> DeviceState<T> {
         cfg: Option<AmneziaConfig>,
     ) -> Result<(), ConfigError> {
         let amnezia = DeviceAmnezia::from_config(cfg)?;
+        // A Phobos server forwards to plain WireGuard.
+        #[cfg(feature = "phobos")]
+        if amnezia.is_some() && self.phobos.is_some() {
+            return Err(ConfigError::CombinedWithPhobos);
+        }
         let current = self.amnezia.load();
         if current.as_ref().map(|a| &a.cfg) == amnezia.as_ref().map(|a| &a.cfg) {
             return Ok(());

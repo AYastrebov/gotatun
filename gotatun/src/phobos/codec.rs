@@ -831,8 +831,10 @@ impl<R: RandomSource> PhobosCodec<R> {
     /// are chosen by whoever sent them, so nothing here is an error.
     pub fn unwrap<'a>(&mut self, datagram: &'a mut [u8], source: SocketAddr) -> Unwrapped<'a> {
         let n = datagram.len();
-        // A plain-looking datagram was never encoded, and the reference never
-        // delivers one intact. See "Receive order" in docs/phobos.md.
+        // A plain-looking datagram was never encoded: the reference client
+        // classifies one as unobfuscated and *encodes* it on its way to the
+        // local WireGuard, so it never arrives intact. Dropping it here is the
+        // same outcome without the wasted work. A Phobos server never sends one.
         if n < 4 || looks_plain(datagram) {
             return Unwrapped::Drop;
         }
