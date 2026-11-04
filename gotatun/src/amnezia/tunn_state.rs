@@ -56,6 +56,11 @@ impl AmneziaTunnState {
         }
     }
 
+    /// The UDP window, for the send boundary to size trailers and widen.
+    pub(crate) fn udp_window_mut(&mut self) -> &mut usize {
+        &mut self.udp_window
+    }
+
     /// The H1/H2 drawer for this tunnel's handshakes.
     pub(crate) fn wire_types(&self) -> WireTypes {
         WireTypes::new(self.cfg.headers)

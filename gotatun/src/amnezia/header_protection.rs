@@ -38,10 +38,19 @@ impl HeaderProtection {
 
     /// The first 148 ChaCha20 keystream bytes (block counter 0) for `nonce12`.
     pub(crate) fn mask(&self, nonce12: &[u8; HEADER_PROTECTION_NONCE_SIZE]) -> [u8; 148] {
-        let mut mask = [0u8; HEADER_PROTECTION_MASK_LEN];
+        self.keystream(nonce12)
+    }
+
+    /// The first `N` ChaCha20 keystream bytes (block counter 0) for `nonce12`.
+    /// The transport send path needs only 16, one block instead of three.
+    pub(crate) fn keystream<const N: usize>(
+        &self,
+        nonce12: &[u8; HEADER_PROTECTION_NONCE_SIZE],
+    ) -> [u8; N] {
+        let mut out = [0u8; N];
         let mut cipher = ChaCha20::new((&self.key).into(), nonce12.into());
-        cipher.apply_keystream(&mut mask);
-        mask
+        cipher.apply_keystream(&mut out);
+        out
     }
 
     /// XOR the first `protected_len` bytes of `msg` (clamped to its length and
