@@ -24,6 +24,8 @@ pub mod amnezia;
 #[cfg(feature = "device")]
 pub mod device;
 pub mod noise;
+#[cfg(feature = "phobos")]
+pub mod phobos;
 pub mod tun;
 pub mod udp;
 
