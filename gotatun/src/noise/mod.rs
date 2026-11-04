@@ -211,6 +211,8 @@ impl<R: RngCore + Send> Tunn<R> {
         mut packet: Packet,
         tun_mtu: Option<&mut MtuWatcher>,
     ) -> Option<WgKind> {
+        #[cfg(feature = "amnezia")]
+        let tun_mtu = self.amnezia_note_mtu(tun_mtu);
         if let Some(tun_mtu) = tun_mtu {
             packet = pad_to_x16(packet, tun_mtu);
         }
@@ -234,10 +236,14 @@ impl<R: RngCore + Send> Tunn<R> {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
+            #[cfg(feature = "amnezia")]
+            let (packet, is_keepalive) = amnezia_pad_transport(self.amnezia.as_mut(), packet);
             let packet = session.format_packet_data(packet)?;
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
-            if !packet.is_keepalive() {
+            #[cfg(not(feature = "amnezia"))]
+            let is_keepalive = packet.is_keepalive();
+            if !is_keepalive {
                 self.timer_tick(TimerName::TimeLastDataPacketSent);
             }
             self.tx_bytes += packet.as_bytes().len();
@@ -298,6 +304,8 @@ impl<R: RngCore + Send> Tunn<R> {
 
         let mut p = p.into_bytes();
         p.truncate(0);
+        #[cfg(feature = "amnezia")]
+        let (p, _) = amnezia_pad_transport(self.amnezia.as_mut(), p);
 
         let keepalive_packet = session
             .format_packet_data(p)
@@ -360,6 +368,8 @@ impl<R: RngCore + Send> Tunn<R> {
     /// successful.
     fn handle_data(&mut self, packet: Packet<WgData>) -> Result<TunnResult, WireGuardError> {
         let decapsulated_packet = self.decapsulate_with_session(packet)?;
+        #[cfg(feature = "amnezia")]
+        let decapsulated_packet = self.amnezia_keepalive(decapsulated_packet);
 
         if !decapsulated_packet.is_empty() {
             self.timer_tick(TimerName::TimeLastDataPacketReceived);
@@ -537,8 +547,50 @@ fn pad_to_x16(mut packet: Packet, tun_mtu: &mut MtuWatcher) -> Packet {
     packet
 }
 
+/// The AmneziaWG send-side transport hook: widen the UDP window and append
+/// content padding to `packet`. Returns the packet and whether it is a
+/// keepalive, judged by its empty payload before padding.
+#[cfg(feature = "amnezia")]
+fn amnezia_pad_transport(
+    state: Option<&mut AmneziaTunnState>,
+    mut packet: Packet,
+) -> (Packet, bool) {
+    let is_keepalive = match state {
+        Some(state) => state.pad_transport(&mut packet),
+        None => packet.is_empty(),
+    };
+    (packet, is_keepalive)
+}
+
 #[cfg(feature = "amnezia")]
 impl<R: RngCore + Send> Tunn<R> {
+    /// With AWG padding on, record the TUN MTU for it and return `None`, so
+    /// WireGuard's pad-to-16 is skipped: amneziawg-go uses the AWG pad size
+    /// instead of the 16-byte alignment, not on top of it.
+    fn amnezia_note_mtu<'m>(
+        &mut self,
+        tun_mtu: Option<&'m mut MtuWatcher>,
+    ) -> Option<&'m mut MtuWatcher> {
+        match (self.amnezia.as_mut(), tun_mtu) {
+            (Some(state), Some(mtu)) if state.pads_content() => {
+                state.set_mtu(usize::from(mtu.get()));
+                None
+            }
+            (_, tun_mtu) => tun_mtu,
+        }
+    }
+
+    /// A decrypted payload whose first byte is 0 is a keepalive: content
+    /// padding makes a keepalive decrypt to zeros, and no IP packet starts
+    /// with 0 (amneziawg-go `receive.go`). Returned empty so the timers and
+    /// the device treat it as one. Any other payload, IP or not, is data.
+    fn amnezia_keepalive(&self, mut packet: Packet) -> Packet {
+        if self.amnezia.is_some() && packet.first() == Some(&0) {
+            packet.truncate(0);
+        }
+        packet
+    }
+
     /// Turn AmneziaWG obfuscation on (`Some`) or off (`None`) for this tunnel.
     ///
     /// Handshakes formatted afterwards carry H1/H2 type values, chosen before
@@ -555,6 +607,23 @@ impl<R: RngCore + Send> Tunn<R> {
     #[allow(dead_code)] // Called by the device send path.
     pub(crate) fn amnezia_udp_window_mut(&mut self) -> Option<&mut usize> {
         self.amnezia.as_mut().map(AmneziaTunnState::udp_window_mut)
+    }
+
+    /// Widen the UDP window to cover a received transport datagram of `size`
+    /// bytes (amneziawg-go `receive.go:517-520`). No-op for plain WireGuard.
+    #[allow(dead_code)] // Called by the device receive path.
+    pub(crate) fn widen_amnezia_udp_window(&mut self, size: usize) {
+        if let Some(state) = self.amnezia.as_mut() {
+            state.widen_udp_window(size);
+        }
+    }
+
+    /// Reset the UDP window to its starting 500 bytes, on endpoint change.
+    #[allow(dead_code)] // Called by the device when a peer's endpoint changes.
+    pub(crate) fn reset_amnezia_udp_window(&mut self) {
+        if let Some(state) = self.amnezia.as_mut() {
+            state.reset_udp_window();
+        }
     }
 }
 
@@ -1487,10 +1556,10 @@ mod tests {
             };
             let window = *a.amnezia_udp_window_mut().unwrap();
             let datagram = seal(&cfg, window, keepalive);
-            assert_eq!(
-                datagram.len(),
-                19 + WgData::OVERHEAD,
-                "S4-prefixed keepalive"
+            assert!(
+                (19 + WgData::OVERHEAD..window).contains(&datagram.len()),
+                "S4-prefixed keepalive, trailer-padded within the window: {}",
+                datagram.len()
             );
             let result = deliver(&cfg, &mut b, datagram);
             assert!(matches!(result, TunnResult::WriteToTunnel(p) if p.is_empty()));
@@ -1504,7 +1573,119 @@ mod tests {
             let TunnResult::WriteToTunnel(received) = deliver(&cfg, &mut b, datagram) else {
                 panic!("session should decrypt the packet");
             };
-            assert_eq!(sent.as_bytes(), received.as_bytes());
+            let (ip, pad) = received.as_bytes().split_at(sent.as_bytes().len());
+            assert_eq!(sent.as_bytes(), ip);
+            assert!(pad.iter().all(|b| *b == 0), "trailer-sized content padding");
+        }
+
+        fn padded_cfg(content: Option<(u32, u32)>, trailers: bool) -> Arc<AmneziaConfig> {
+            let mut c = (*awg_cfg(23, 87)).clone();
+            c.content_padding = content.map(|(lo, hi)| crate::amnezia::U32Range { lo, hi });
+            c.random_trailers = trailers;
+            Arc::new(c)
+        }
+
+        /// Complete a handshake from `a` to `b` through the AWG framing.
+        fn awg_connect(cfg: &Arc<AmneziaConfig>, a: &mut Tunn, b: &mut Tunn) {
+            let init = create_handshake_init(a);
+            let result = deliver(cfg, b, seal(cfg, 500, init));
+            let TunnResult::WriteToNetwork(resp) = result else {
+                panic!("expected a handshake response, got {result:?}");
+            };
+            let result = deliver(cfg, a, seal(cfg, 500, resp));
+            let TunnResult::WriteToNetwork(keepalive) = result else {
+                panic!("expected a keepalive after the handshake, got {result:?}");
+            };
+            let result = deliver(cfg, b, seal(cfg, 500, keepalive));
+            assert!(matches!(result, TunnResult::WriteToTunnel(p) if p.is_empty()));
+        }
+
+        /// Sending widens the window by the pre-padding datagram size
+        /// (`S4 + 32 + plaintext`), with or without any padding mode.
+        #[test]
+        fn window_widens_unconditionally() {
+            for cfg in [padded_cfg(None, false), padded_cfg(Some((1, 64)), true)] {
+                let (mut a, mut b) = awg_tuns(&cfg);
+                awg_connect(&cfg, &mut a, &mut b);
+
+                let mut big = create_ipv4_udp_packet().into_bytes();
+                big.buf_mut().resize(1_200, 0);
+                let mut mtu = MtuWatcher::new(1_420);
+                a.handle_outgoing_packet(big, Some(&mut mtu))
+                    .expect("session encrypts");
+                let window = *a.amnezia_udp_window_mut().unwrap();
+                assert_eq!(window, 19 + WgData::OVERHEAD + 1_200);
+
+                a.handle_outgoing_packet(create_ipv4_udp_packet().into_bytes(), None)
+                    .expect("session encrypts");
+                assert_eq!(*a.amnezia_udp_window_mut().unwrap(), window);
+
+                a.reset_amnezia_udp_window();
+                assert_eq!(*a.amnezia_udp_window_mut().unwrap(), 500);
+            }
+        }
+
+        /// A content-padded keepalive decrypts to zeros; the receiver takes
+        /// the zero first byte for a keepalive, not data. The sender, for its
+        /// part, decides by the empty payload before padding.
+        #[test]
+        fn padded_keepalive_detected_by_zero_byte() {
+            let cfg = padded_cfg(Some((40, 40)), false);
+            let (mut a, mut b) = awg_tuns(&cfg);
+            awg_connect(&cfg, &mut a, &mut b);
+
+            const SENTINEL: Duration = Duration::from_secs(1234);
+            a.timers[TimerName::TimeLastDataPacketSent] = SENTINEL;
+            let keepalive = a
+                .handle_outgoing_packet(Packet::from_bytes(BytesMut::new()), None)
+                .expect("session encrypts");
+            let WgKind::Data(keepalive) = keepalive else {
+                panic!("expected a data packet, got {keepalive:?}");
+            };
+            assert_eq!(keepalive.as_bytes().len(), WgData::OVERHEAD + 40, "padded");
+            assert_eq!(a.timers[TimerName::TimeLastDataPacketSent], SENTINEL);
+
+            b.timers[TimerName::TimeLastDataPacketReceived] = SENTINEL;
+            let result = deliver(&cfg, &mut b, seal(&cfg, 500, keepalive));
+            assert!(
+                matches!(&result, TunnResult::WriteToTunnel(p) if p.is_empty()),
+                "padded keepalive reaches the device as a keepalive, got {result:?}"
+            );
+            assert_eq!(b.timers[TimerName::TimeLastDataPacketReceived], SENTINEL);
+
+            // Data still counts as data, padded or not.
+            let sent = create_ipv4_udp_packet();
+            let data = a
+                .handle_outgoing_packet(sent.clone().into_bytes(), None)
+                .expect("session encrypts");
+            let TunnResult::WriteToTunnel(received) = deliver(&cfg, &mut b, seal(&cfg, 500, data))
+            else {
+                panic!("session should decrypt the packet");
+            };
+            assert_eq!(
+                &received.as_bytes()[..sent.as_bytes().len()],
+                sent.as_bytes()
+            );
+            assert_ne!(b.timers[TimerName::TimeLastDataPacketReceived], SENTINEL);
+        }
+
+        /// With content padding or trailers on, the pad replaces WireGuard's
+        /// 16-byte alignment instead of adding to it (amneziawg-go
+        /// `send.go:609-616`).
+        #[test]
+        fn awg_padding_replaces_x16() {
+            let cfg = padded_cfg(Some((5, 5)), false);
+            let (mut a, mut b) = awg_tuns(&cfg);
+            awg_connect(&cfg, &mut a, &mut b);
+            let mut sent = create_ipv4_udp_packet().into_bytes();
+            let len = sent.len() + 3;
+            sent.buf_mut().resize(len, 0);
+            assert!(!len.is_multiple_of(16) && !(len + 5).is_multiple_of(16));
+            let mut mtu = MtuWatcher::new(1_420);
+            let Some(WgKind::Data(data)) = a.handle_outgoing_packet(sent, Some(&mut mtu)) else {
+                panic!("session encrypts");
+            };
+            assert_eq!(data.as_bytes().len(), WgData::OVERHEAD + len + 5);
         }
 
         /// Negative control: a plain WireGuard receiver must not take an
