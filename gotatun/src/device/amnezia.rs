@@ -79,7 +79,11 @@ pub(super) async fn send_wg(
     };
     let mut datagrams = Vec::new();
     if let Err(e) = obfs.seal(packet, window, &mut datagrams) {
-        tracing::trace!("Dropping AmneziaWG message: {e}");
+        if obfs.first_seal_failure() {
+            tracing::warn!("Dropping AmneziaWG message: {e} (further drops are logged at trace)");
+        } else {
+            tracing::trace!("Dropping AmneziaWG message: {e}");
+        }
         return Ok(());
     }
     for datagram in datagrams {

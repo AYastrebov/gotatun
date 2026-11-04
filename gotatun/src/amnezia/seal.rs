@@ -6,6 +6,7 @@
 //! header protection and AWG 3.1 random trailers.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::BytesMut;
 use zerocopy::IntoBytes;
@@ -42,6 +43,9 @@ pub(crate) enum SealError {
 pub(crate) struct Obfuscator {
     cfg: Arc<AmneziaConfig>,
     hp: Option<HeaderProtection>,
+    /// Set once a seal failed, so the failure is logged loudly only once per
+    /// config.
+    seal_failed: Arc<AtomicBool>,
 }
 
 impl Obfuscator {
@@ -59,7 +63,18 @@ impl Obfuscator {
             "header protection needs S1..S4 >= 12; validate the config first"
         );
         let hp = cfg.header_protection_key.map(HeaderProtection::new);
-        Obfuscator { cfg, hp }
+        Obfuscator {
+            cfg,
+            hp,
+            seal_failed: Arc::default(),
+        }
+    }
+
+    /// Record a seal failure. Returns `true` the first time only, for a
+    /// one-off warning: a config that cannot be sealed (an I-chain over 65535
+    /// bytes) fails on every initiation.
+    pub(crate) fn first_seal_failure(&self) -> bool {
+        !self.seal_failed.swap(true, Ordering::Relaxed)
     }
 
     /// Append the datagrams that carry `packet` to `out`.
@@ -720,6 +735,17 @@ mod tests {
                 "control: only {unredrawn_hits} of {N} unredrawn datagrams collide"
             );
         }
+    }
+
+    #[test]
+    fn seal_failure_is_reported_first_once() {
+        let obfs = Obfuscator::new(Arc::new(awg_cfg(false, false)));
+        let shared = obfs.clone();
+        assert!(obfs.first_seal_failure());
+        assert!(!obfs.first_seal_failure());
+        assert!(!shared.first_seal_failure(), "clones share the flag");
+        let fresh = Obfuscator::new(Arc::new(awg_cfg(false, false)));
+        assert!(fresh.first_seal_failure(), "a new config warns again");
     }
 
     /// An unvalidated config whose prefix cannot hold the header-protection
