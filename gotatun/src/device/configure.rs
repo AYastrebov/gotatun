@@ -226,15 +226,16 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
     ///
     /// The config is validated first; on error nothing changes. Otherwise every
     /// peer's tunnel is rebuilt, keeping its keys, endpoint and explicit timer
-    /// params, so each peer handshakes again under the new config. Setting the
-    /// current config again is a no-op.
+    /// params, so each peer handshakes again under the new config. The rebuild
+    /// resets each peer's tx/rx byte stats and drops packets queued while
+    /// waiting for a handshake. The connection keeps its UDP sockets; nothing
+    /// is rebound. Setting the current config again is a no-op.
     #[cfg(feature = "amnezia")]
     pub async fn set_amnezia(
         &mut self,
         cfg: Option<crate::amnezia::AmneziaConfig>,
     ) -> Result<(), crate::amnezia::ConfigError> {
-        self.reconfigure |= self.device.set_amnezia(cfg).await?;
-        Ok(())
+        self.device.set_amnezia(cfg).await
     }
 
     /// Return the device's AmneziaWG configuration, `None` for plain WireGuard.

@@ -315,7 +315,7 @@ impl<Udp: UdpTransportFactory, TunTx: IpSend, TunRx: IpRecv> DeviceBuilder<Udp, 
             peers_by_ip: AllowedIps::new(),
             rate_limiter: None,
             #[cfg(feature = "amnezia")]
-            amnezia,
+            amnezia: super::amnezia::AmneziaCell::new(amnezia),
             port: self.port,
             connection: None,
             suspended: self.suspended,

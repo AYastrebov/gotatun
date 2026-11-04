@@ -135,7 +135,9 @@ async fn drain<S: Stream<Item = Packet>>(stream: S, idle: Duration) -> Vec<Packe
 async fn ping(from: &MockDevice, to: &mut MockDevice, payload: &[u8]) {
     let packet = mock::packet(payload);
     from.app_tx.send(packet.clone()).await;
-    let got = timeout(Duration::from_secs(10), to.app_rx.recv())
+    // With AWG 3.1 trailers a handshake is misread as transport about 1% of
+    // the time (|H4| / 2^32) and only a retry recovers, so the clock must run.
+    let got = with_running_clock(timeout(Duration::from_secs(10), to.app_rx.recv()))
         .await
         .expect("packet should be delivered");
     assert_eq!(got.as_bytes(), packet.as_bytes());
@@ -423,7 +425,7 @@ async fn cookie_under_load_has_trailer_and_handshake_completes() {
         let to_alice = sent_to(&eve, ALICE_V4.into());
         let (datagrams, ()) = tokio::join!(
             drain(to_alice, Duration::from_millis(1500)),
-            with_running_clock(ping(&alice, &mut bob, b"after the cookie")),
+            ping(&alice, &mut bob, b"after the cookie"),
         );
         let cookies: Vec<_> = datagrams
             .iter()
@@ -630,4 +632,147 @@ async fn udp_window_widens_on_receive_and_resets_on_roaming() {
     let small = datagrams.iter().map(|d| d.len()).max().unwrap();
     assert!(small < 500);
     assert_eq!(peer_window(&bob).await, 500);
+}
+
+/// IPv6 flow labels of sniffed datagrams. The mock channel writes its
+/// per-bind connection id there, so a rebind changes it.
+fn flow_labels(datagrams: &[Packet<crate::packet::Ipv6<crate::packet::Udp>>]) -> Vec<u32> {
+    datagrams
+        .iter()
+        .map(|p| {
+            let field = p.header.version_traffic_flow;
+            field.flow_label()
+        })
+        .collect()
+}
+
+/// R13: a mid-traffic swap keeps the connection and its sockets (an embedder
+/// may hand over a socket pair it cannot bind again), and traffic resumes
+/// under the new config.
+#[tokio::test]
+#[test_log::test]
+async fn set_amnezia_mid_traffic_keeps_sockets() {
+    let bob_v6: IpAddr = "fd00::2".parse().unwrap();
+    let (mut alice, mut bob, eve) = awg_pair(awg30()).await;
+    let bob_key = alice.device.peers().await[0].peer.public_key;
+    alice
+        .device
+        .modify_peer(&bob_key, |p| {
+            p.set_endpoint(Some(SocketAddr::new(bob_v6, 51820)))
+        })
+        .await
+        .unwrap();
+
+    let collect_v6 = |eve: &mock::MockEavesdropper| {
+        let stream = eve.ipv6();
+        async move {
+            let mut stream = std::pin::pin!(stream);
+            let mut out = vec![];
+            while let Ok(Some(p)) = timeout(Duration::from_millis(500), stream.next()).await {
+                out.push(p);
+            }
+            out
+        }
+    };
+
+    let (before, ()) = tokio::join!(collect_v6(&eve), async {
+        ping(&alice, &mut bob, b"before").await;
+        ping(&bob, &mut alice, b"before").await;
+    });
+    // Alice to fd00::2, and Bob's replies (to Alice's `::` source, where
+    // Alice then roams to as well): both sockets' labels.
+    let sockets = flow_labels(&before);
+    assert!(sockets.len() >= 2);
+
+    let cfg = awg31();
+    for device in [&alice, &bob] {
+        let cfg = cfg.clone();
+        device
+            .device
+            .write(async |d| d.set_amnezia(Some(cfg)).await)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let (after, ()) = tokio::join!(collect_v6(&eve), async {
+        ping(&alice, &mut bob, b"after").await;
+        ping(&bob, &mut alice, b"after").await;
+    });
+    let labels = flow_labels(&after);
+    assert!(!labels.is_empty());
+    assert!(
+        labels.iter().all(|l| sockets.contains(l)),
+        "a socket was rebound: {sockets:?} -> {labels:?}"
+    );
+    let deobfs = Deobfuscator::new(Arc::new(cfg));
+    assert!(
+        after
+            .into_iter()
+            .map(|p| p.into_payload().into_payload())
+            .any(|d| deobfs.classify(&d).map(|c| c.kind) == Some(WgPacketType::HandshakeInit)),
+        "re-handshake under the new config"
+    );
+}
+
+/// DAITA and Amnezia together: DAITA's decoys go out sealed, so the plain
+/// receiver decrypts them (its UDP window grows to the decoy's size) and the
+/// wire still shows no standard types.
+#[cfg(feature = "daita")]
+#[tokio::test]
+#[test_log::test]
+async fn daita_decoys_are_sealed() {
+    use crate::device::Peer;
+    use crate::device::daita::DaitaSettings;
+    use ipnetwork::Ipv4Network;
+    use std::str::FromStr;
+
+    // On each normal packet, send one decoy 1 µs later (maybenot 2 machine:
+    // state 0 -NormalSent-> 1 [SendPadding] -PaddingSent-> 0).
+    const DECOY_MACHINE: &str =
+        "02eNpVjLENACAMwxw4jNc4l5GdBVFAbb1UjeKsUTFm41PukQTd4/OSy0FKPNUMX9gGCQe9";
+
+    let (alice, mut bob, eve) = awg_pair(awg30()).await;
+    let bob_key = alice.device.peers().await[0].peer.public_key;
+    let daita = DaitaSettings {
+        maybenot_machines: vec![maybenot::Machine::from_str(DECOY_MACHINE).unwrap()],
+        max_decoy_frac: 1.0,
+        ..DaitaSettings::default()
+    };
+    alice.device.remove_peer(&bob_key).await.unwrap();
+    alice
+        .device
+        .add_peer(
+            Peer::new(bob_key)
+                .with_endpoint((BOB_V4, 51820).into())
+                .with_allowed_ip(Ipv4Network::new(Ipv4Addr::UNSPECIFIED, 0).unwrap().into())
+                .with_daita(daita),
+        )
+        .await
+        .unwrap();
+    // DAITA hooks start with the connection.
+    Connection::set_up(alice.device.inner.clone())
+        .await
+        .unwrap();
+
+    let seen = eve.udp().map(|udp| udp.into_payload());
+    let (datagrams, ()) = tokio::join!(drain(seen, Duration::from_millis(500)), async {
+        for _ in 0..3 {
+            ping(&alice, &mut bob, b"hi").await;
+        }
+    });
+    for d in &datagrams {
+        for t in 1u8..=4 {
+            assert!(
+                !d.starts_with(&[t, 0, 0, 0]),
+                "standard type {t} on the wire"
+            );
+        }
+    }
+    let decoy = usize::from(awg30().padding.s4) + 16 + usize::from(mock::TUN_MTU);
+    assert!(
+        peer_window(&bob).await >= decoy,
+        "bob decrypted no decoy: window {}",
+        peer_window(&bob).await
+    );
 }

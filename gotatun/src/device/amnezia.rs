@@ -10,7 +10,7 @@ use std::sync::{Arc, Weak};
 
 use tokio::sync::RwLock;
 
-use super::{DeviceState, DeviceTransports, PeerState, Reconfigure};
+use super::{DeviceState, DeviceTransports, PeerState};
 use crate::amnezia::classify::Deobfuscator;
 use crate::amnezia::seal::Obfuscator;
 use crate::amnezia::timers::{timer_extras_from, timer_params_from};
@@ -103,17 +103,47 @@ pub(super) fn observe_received(tunnel: &mut Tunn, result: &TunnResult, datagram_
     }
 }
 
+/// The device's Amnezia state, shared by the device, the connection tasks and
+/// DAITA's sender. [`DeviceState::set_amnezia`] swaps it in place, so a config
+/// change never restarts the connection or rebinds UDP (ruling R13: an
+/// embedder such as shoes hands over one pre-bound socket pair and cannot
+/// bind again). Read per datagram; a swap happens under the device write lock,
+/// so readers holding the device read lock see the state that matches the
+/// peers' `Tunn`s.
+#[derive(Clone, Default)]
+pub(super) struct AmneziaCell(Arc<parking_lot::RwLock<Option<Arc<DeviceAmnezia>>>>);
+
+impl AmneziaCell {
+    pub(super) fn new(amnezia: Option<Arc<DeviceAmnezia>>) -> Self {
+        AmneziaCell(Arc::new(parking_lot::RwLock::new(amnezia)))
+    }
+
+    /// The current state, `None` for plain WireGuard.
+    pub(super) fn load(&self) -> Option<Arc<DeviceAmnezia>> {
+        self.0.read().clone()
+    }
+
+    fn store(&self, amnezia: Option<Arc<DeviceAmnezia>>) {
+        *self.0.write() = amnezia;
+    }
+}
+
+/// The obfuscator of a loaded state, for [`send_wg`].
+pub(super) fn obfs(amnezia: &Option<Arc<DeviceAmnezia>>) -> Option<&Obfuscator> {
+    amnezia.as_deref().map(DeviceAmnezia::obfuscator)
+}
+
 /// Stand-in for the [`RateLimiter`] on the receive path. With Amnezia
 /// configured, every datagram is classified and de-obfuscated, then verified
 /// as the kind it classified as; the plain `verify_packet` would trust the low
 /// type byte alone. Without Amnezia it is the upstream `verify_packet`.
 pub(super) struct ReceiveGate {
     rate_limiter: Arc<RateLimiter>,
-    amnezia: Option<Arc<DeviceAmnezia>>,
+    amnezia: AmneziaCell,
 }
 
 impl ReceiveGate {
-    pub(super) fn new(rate_limiter: Arc<RateLimiter>, amnezia: Option<Arc<DeviceAmnezia>>) -> Self {
+    pub(super) fn new(rate_limiter: Arc<RateLimiter>, amnezia: AmneziaCell) -> Self {
         ReceiveGate {
             rate_limiter,
             amnezia,
@@ -127,7 +157,7 @@ impl ReceiveGate {
         src_addr: SocketAddr,
         packet: Packet,
     ) -> Result<WgKind, TunnResult> {
-        let Some(amnezia) = &self.amnezia else {
+        let Some(amnezia) = self.amnezia.load() else {
             return self.rate_limiter.verify_packet(src_addr, packet);
         };
         let (packet, kind) = amnezia
@@ -138,32 +168,30 @@ impl ReceiveGate {
             .verify_classified(src_addr, packet, kind, amnezia.cfg.disable_cookies)
     }
 
-    /// The obfuscator for replies sent before any peer is known (under-load
-    /// cookie replies).
-    pub(super) fn obfuscator(&self) -> Option<&Obfuscator> {
-        self.amnezia.as_deref().map(DeviceAmnezia::obfuscator)
+    /// The current state, for replies sent before any peer is known
+    /// (under-load cookie replies).
+    pub(super) fn amnezia(&self) -> Option<Arc<DeviceAmnezia>> {
+        self.amnezia.load()
     }
 }
 
 impl<T: DeviceTransports> DeviceState<T> {
-    /// The device's Amnezia state as the connection tasks see it. They take
-    /// it once when they start; [`DeviceState::set_amnezia`] restarts them.
-    pub(super) async fn amnezia_snapshot(
-        device: &Weak<RwLock<Self>>,
-    ) -> Option<Arc<DeviceAmnezia>> {
-        let device = device.upgrade()?;
-        let device = device.read().await;
-        device.amnezia.clone()
+    /// The shared cell the receive path and DAITA read the state from.
+    pub(super) async fn amnezia_cell(device: &Weak<RwLock<Self>>) -> AmneziaCell {
+        match device.upgrade() {
+            Some(device) => device.read().await.amnezia.clone(),
+            None => AmneziaCell::default(),
+        }
     }
 
-    /// The obfuscator, for send sites that hold the device lock.
-    pub(super) fn amnezia_obfuscator(&self) -> Option<&Obfuscator> {
-        self.amnezia.as_deref().map(DeviceAmnezia::obfuscator)
+    /// The current state, for send sites that hold the device lock.
+    pub(super) fn amnezia_current(&self) -> Option<Arc<DeviceAmnezia>> {
+        self.amnezia.load()
     }
 
     /// The device's Amnezia config, `None` for plain WireGuard.
     pub(super) fn amnezia_config(&self) -> Option<AmneziaConfig> {
-        self.amnezia.as_ref().map(|a| AmneziaConfig::clone(&a.cfg))
+        self.amnezia.load().map(|a| AmneziaConfig::clone(&a.cfg))
     }
 
     /// Give a peer's new `Tunn` the device's Amnezia state and timing ranges.
@@ -175,7 +203,9 @@ impl<T: DeviceTransports> DeviceState<T> {
         tunn: &mut Tunn,
         danger_timer_params: Option<&TimerParams>,
     ) {
-        let Some(amnezia) = &self.amnezia else { return };
+        let Some(amnezia) = self.amnezia.load() else {
+            return;
+        };
         tunn.set_amnezia(Some(AmneziaTunnState::new(Arc::clone(&amnezia.cfg))));
         tunn.set_timer_extras(timer_extras_from(&amnezia.cfg.timings));
         if danger_timer_params.is_none() {
@@ -194,7 +224,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         peer.danger_timer_params = params.clone();
         params.or_else(|| {
             self.amnezia
-                .as_ref()
+                .load()
                 .map(|a| timer_params_from(&a.cfg.timings))
         })
     }
@@ -203,17 +233,19 @@ impl<T: DeviceTransports> DeviceState<T> {
     /// peer's `Tunn` (keeping keys, endpoints and explicit timer params), so
     /// each peer handshakes again under the new config.
     ///
-    /// Returns whether the connection must be restarted: its tasks hold the
-    /// previous config.
+    /// The connection keeps running on the same sockets: its tasks read the
+    /// swapped state from the shared [`AmneziaCell`] per datagram. Per-peer
+    /// tx/rx stats start over and packets queued for a handshake are dropped.
     pub(super) async fn set_amnezia(
         &mut self,
         cfg: Option<AmneziaConfig>,
-    ) -> Result<Reconfigure, ConfigError> {
+    ) -> Result<(), ConfigError> {
         let amnezia = DeviceAmnezia::from_config(cfg)?;
-        if self.amnezia.as_ref().map(|a| &a.cfg) == amnezia.as_ref().map(|a| &a.cfg) {
-            return Ok(Reconfigure::No);
+        let current = self.amnezia.load();
+        if current.as_ref().map(|a| &a.cfg) == amnezia.as_ref().map(|a| &a.cfg) {
+            return Ok(());
         }
-        self.amnezia = amnezia;
+        self.amnezia.store(amnezia);
 
         // Without a key there are no peers yet; they are built from the new
         // config when added.
@@ -236,31 +268,24 @@ impl<T: DeviceTransports> DeviceState<T> {
             }
         }
         tracing::info!("AmneziaWG configuration updated, peers rebuilt");
-
-        Ok(if self.connection.is_some() {
-            Reconfigure::Yes
-        } else {
-            Reconfigure::No
-        })
+        Ok(())
     }
 }
 
 /// The UDP sender handed to DAITA, which sends decoys and delayed transport
-/// packets on its own: seals them as [`send_wg`] would.
+/// packets on its own: seals them as [`send_wg`] would, with the state current
+/// at send time.
 #[cfg(feature = "daita")]
 #[derive(Clone)]
 pub(super) struct SealingUdpSend<U> {
     inner: U,
-    obfs: Option<Obfuscator>,
+    amnezia: AmneziaCell,
 }
 
 #[cfg(feature = "daita")]
 impl<U> SealingUdpSend<U> {
-    pub(super) fn new(inner: U, amnezia: Option<&DeviceAmnezia>) -> Self {
-        SealingUdpSend {
-            inner,
-            obfs: amnezia.map(|a| a.obfs.clone()),
-        }
+    pub(super) fn new(inner: U, amnezia: AmneziaCell) -> Self {
+        SealingUdpSend { inner, amnezia }
     }
 }
 
@@ -269,22 +294,26 @@ impl<U: UdpSend> UdpSend for SealingUdpSend<U> {
     type SendManyBuf = ();
 
     async fn send_to(&self, packet: Packet, destination: SocketAddr) -> io::Result<()> {
-        let Some(obfs) = &self.obfs else {
+        let amnezia = self.amnezia.load();
+        if amnezia.is_none() {
             return self.inner.send_to(packet, destination).await;
-        };
+        }
         // DAITA only sends transport packets, whose framing needs no window.
         match packet.try_into_wg() {
             Ok(packet) => {
                 send_wg(
                     &self.inner,
-                    Some(obfs),
+                    obfs(&amnezia),
                     INITIAL_UDP_WINDOW,
                     packet,
                     destination,
                 )
                 .await
             }
-            Err(_) => Ok(()),
+            Err(e) => {
+                tracing::trace!("Dropping non-WireGuard packet from DAITA: {e}");
+                Ok(())
+            }
         }
     }
 
