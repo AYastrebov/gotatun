@@ -12,6 +12,8 @@
 
 //! WireGuard device implementation with support for peers, handshakes, and packet routing.
 pub(crate) mod allowed_ips;
+#[cfg(feature = "amnezia")]
+mod amnezia;
 mod builder;
 pub mod configure;
 #[cfg(feature = "daita")]
@@ -101,6 +103,11 @@ pub enum Error {
     /// The device has no active connection, e.g. because it is suspended
     #[error("The device has no active connection")]
     NotConnected,
+
+    /// The AmneziaWG configuration is invalid
+    #[cfg(feature = "amnezia")]
+    #[error("Invalid AmneziaWG configuration: {0}")]
+    Amnezia(#[from] crate::amnezia::ConfigError),
 }
 
 /// A reference-counted handle to a WireGuard device.
@@ -140,6 +147,10 @@ pub(crate) struct DeviceState<T: DeviceTransports> {
     index_table: IndexTable,
 
     rate_limiter: Option<Arc<RateLimiter>>,
+
+    /// Device-wide AmneziaWG state; `None` is plain WireGuard.
+    #[cfg(feature = "amnezia")]
+    amnezia: Option<Arc<amnezia::DeviceAmnezia>>,
 
     port: u16,
     udp_factory: T::UdpTransportFactory,
@@ -215,6 +226,9 @@ impl<T: DeviceTransports> Connection<T> {
         // Start DAITA/hooks tasks
         #[cfg(feature = "daita")]
         for peer_arc in device.peers.values() {
+            #[cfg(feature = "amnezia")]
+            let buffered_udp_tx =
+                amnezia::SealingUdpSend::new(buffered_udp_tx.clone(), device.amnezia.as_deref());
             PeerState::maybe_start_daita(
                 peer_arc,
                 pool.clone(),
@@ -382,9 +396,21 @@ impl<T: DeviceTransports> Device<T> {
             if let Some((packet, endpoint_addr)) = initiation {
                 let packet = WgKind::from(packet);
                 DeviceState::<T>::register_handshake_idx(&device.peers_by_idx, &packet, peer_arc);
+                #[cfg(feature = "amnezia")]
+                let window = amnezia::udp_window(&mut peer.tunnel);
                 drop(peer);
 
                 // NOTE: Like `handle_timers`, this does not trigger DAITA events.
+                #[cfg(feature = "amnezia")]
+                amnezia::send_wg(
+                    &connection.udp,
+                    device.amnezia_obfuscator(),
+                    window,
+                    packet,
+                    endpoint_addr,
+                )
+                .await?;
+                #[cfg(not(feature = "amnezia"))]
                 connection.udp.send_to(packet.into(), endpoint_addr).await?;
             }
 
@@ -489,6 +515,11 @@ impl<T: DeviceTransports> DeviceState<T> {
             rate_limiter,
         );
 
+        #[cfg(feature = "amnezia")]
+        self.amnezia_setup_tunn(&mut tunn, peer_builder.danger_timer_params.as_ref());
+        #[cfg(feature = "amnezia")]
+        let danger_timer_params = peer_builder.danger_timer_params.clone();
+
         if let Some(timer_params) = peer_builder.danger_timer_params {
             tunn.dangerously_set_timer_params(timer_params);
         }
@@ -499,6 +530,8 @@ impl<T: DeviceTransports> DeviceState<T> {
             peer_builder.allowed_ips.as_slice(),
             #[cfg(feature = "daita")]
             peer_builder.daita_settings,
+            #[cfg(feature = "amnezia")]
+            danger_timer_params,
         )
     }
 
@@ -646,10 +679,22 @@ impl<T: DeviceTransports> DeviceState<T> {
                         // Register sender_idx from outgoing handshake packets
                         Self::register_handshake_idx(&device.peers_by_idx, &packet, peer);
 
+                        #[cfg(feature = "amnezia")]
+                        let window = amnezia::udp_window(&mut p.tunnel);
                         drop(p);
 
                         // NOTE: we don't bother with triggering TunnelRecv DAITA events here.
 
+                        #[cfg(feature = "amnezia")]
+                        let _ = amnezia::send_wg(
+                            &udp,
+                            device.amnezia_obfuscator(),
+                            window,
+                            packet,
+                            endpoint_addr,
+                        )
+                        .await;
+                        #[cfg(not(feature = "amnezia"))]
                         let _ = udp.send_to(packet.into(), endpoint_addr).await;
                     }
                     Ok(None) => {}
@@ -683,16 +728,34 @@ impl<T: DeviceTransports> DeviceState<T> {
             let tun_mtu = device.tun_rx_mtu.clone();
             (private_key, public_key, rate_limiter, tun_mtu)
         };
+        // With Amnezia configured, every datagram is de-obfuscated and
+        // verified as the kind it classifies as.
+        #[cfg(feature = "amnezia")]
+        let rate_limiter =
+            amnezia::ReceiveGate::new(rate_limiter, Self::amnezia_snapshot(&device).await);
 
         loop {
             let (src_buf, addr) = udp_rx
                 .recv_from(&mut packet_pool)
                 .await
                 .map_err(Error::IoError)?;
+            #[cfg(feature = "amnezia")]
+            let datagram_len = src_buf.len();
             let parsed_packet = match rate_limiter.verify_packet(addr, src_buf) {
                 Ok(packet) => packet,
                 Err(TunnResult::WriteToNetwork(WgKind::CookieReply(cookie))) => {
                     // Note: Cookies should not affect counters.
+                    #[cfg(feature = "amnezia")]
+                    amnezia::send_wg(
+                        &udp_tx,
+                        rate_limiter.obfuscator(),
+                        crate::amnezia::tunn_state::INITIAL_UDP_WINDOW,
+                        cookie.into(),
+                        addr,
+                    )
+                    .await
+                    .map_err(Error::IoError)?;
+                    #[cfg(not(feature = "amnezia"))]
                     udp_tx
                         .send_to(cookie.into(), addr)
                         .await
@@ -733,6 +796,8 @@ impl<T: DeviceTransports> DeviceState<T> {
             let mut peer = peer_arc.lock().await;
 
             let result = peer.handle_incoming_packet(parsed_packet, addr);
+            #[cfg(feature = "amnezia")]
+            amnezia::observe_received(&mut peer.tunnel, &result, datagram_len);
 
             #[cfg(feature = "daita")]
             let PeerState { tunnel, daita, .. } = &mut *peer;
@@ -747,6 +812,9 @@ impl<T: DeviceTransports> DeviceState<T> {
                     // Register sender_idx from outgoing handshake packets
                     Self::register_handshake_idx(&device_guard.peers_by_idx, &packet, &peer_arc);
 
+                    #[cfg(feature = "amnezia")]
+                    let (obfs, window) = (rate_limiter.obfuscator(), amnezia::udp_window(tunnel));
+
                     // TODO: does this end up with the packets being out-of-order?
                     let packets =
                         std::iter::once(packet).chain(tunnel.get_queued_packets(&mut tun_mtu));
@@ -758,7 +826,11 @@ impl<T: DeviceTransports> DeviceState<T> {
                     });
 
                     for packet in packets {
-                        if let Err(_err) = udp_tx.send_to(packet.into(), addr).await {
+                        #[cfg(feature = "amnezia")]
+                        let sent = amnezia::send_wg(&udp_tx, obfs, window, packet, addr).await;
+                        #[cfg(not(feature = "amnezia"))]
+                        let sent = udp_tx.send_to(packet.into(), addr).await;
+                        if let Err(_err) = sent {
                             tracing::trace!("udp.send_to failed");
                             break;
                         }
@@ -828,6 +900,8 @@ impl<T: DeviceTransports> DeviceState<T> {
             let device = device.read().await;
             device.tun_rx_mtu.clone()
         };
+        #[cfg(feature = "amnezia")]
+        let amnezia_state = Self::amnezia_snapshot(&device).await;
 
         loop {
             let packets = match tun_rx.recv(&mut packet_pool).await {
@@ -889,8 +963,11 @@ impl<T: DeviceTransports> DeviceState<T> {
 
                 // Register sender_idx from outgoing handshake packets
                 Self::register_handshake_idx(&device_guard.peers_by_idx, &packet, &peer_arc);
+                #[cfg(feature = "amnezia")]
+                let window = amnezia::udp_window(tunnel);
 
                 #[cfg(feature = "daita")]
+                #[cfg_attr(feature = "amnezia", allow(clippy::useless_conversion))]
                 let packet = match daita {
                     None => packet.into(),
                     Some(daita) => match daita.on_tunnel_sent(packet) {
@@ -898,13 +975,21 @@ impl<T: DeviceTransports> DeviceState<T> {
                         None => continue,
                     },
                 };
-                #[cfg(not(feature = "daita"))]
+                #[cfg(not(any(feature = "daita", feature = "amnezia")))]
                 let packet = packet.into();
 
                 drop(peer); // release lock
                 drop(device_guard);
 
-                if udp.send_to(packet, peer_addr).await.is_err() {
+                #[cfg(feature = "amnezia")]
+                let obfs = amnezia_state
+                    .as_deref()
+                    .map(amnezia::DeviceAmnezia::obfuscator);
+                #[cfg(feature = "amnezia")]
+                let sent = amnezia::send_wg(&udp, obfs, window, packet, peer_addr).await;
+                #[cfg(not(feature = "amnezia"))]
+                let sent = udp.send_to(packet, peer_addr).await;
+                if sent.is_err() {
                     break;
                 }
             }

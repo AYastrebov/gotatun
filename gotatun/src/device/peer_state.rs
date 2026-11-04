@@ -55,6 +55,11 @@ pub struct PeerState {
 
     /// Notified whenever a handshake that we initiated completes.
     handshake_completed: watch::Sender<()>,
+
+    /// The peer's explicit timer params, which win over the AmneziaWG timing
+    /// ranges and are kept when the device's Amnezia config changes.
+    #[cfg(feature = "amnezia")]
+    pub(crate) danger_timer_params: Option<crate::noise::TimerParams>,
 }
 
 impl PeerState {
@@ -63,6 +68,7 @@ impl PeerState {
         endpoint: Option<SocketAddr>,
         allowed_ips: &[IpNetwork],
         #[cfg(feature = "daita")] daita_settings: Option<DaitaSettings>,
+        #[cfg(feature = "amnezia")] danger_timer_params: Option<crate::noise::TimerParams>,
     ) -> PeerState {
         Self {
             tunnel,
@@ -73,6 +79,8 @@ impl PeerState {
             #[cfg(feature = "daita")]
             daita: None,
             handshake_completed: watch::Sender::new(()),
+            #[cfg(feature = "amnezia")]
+            danger_timer_params,
         }
     }
 
@@ -83,6 +91,16 @@ impl PeerState {
     pub fn handle_incoming_packet(&mut self, packet: WgKind, addr: SocketAddr) -> TunnResult {
         let is_handshake_resp = matches!(packet, WgKind::HandshakeResp(_));
         let result = self.tunnel.handle_incoming_packet(packet);
+        // A new endpoint starts a new path, so its AmneziaWG UDP window starts
+        // over (amneziawg-go `SetEndpointFromPacket`).
+        #[cfg(feature = "amnezia")]
+        if matches!(
+            result,
+            TunnResult::WriteToNetwork(_) | TunnResult::WriteToTunnel(_)
+        ) && self.endpoint.addr != Some(addr)
+        {
+            self.tunnel.reset_amnezia_udp_window();
+        }
         match result {
             TunnResult::WriteToNetwork(_) => {
                 self.endpoint.addr = Some(addr);

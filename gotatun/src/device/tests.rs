@@ -24,6 +24,8 @@ use crate::noise::TimerParams;
 use crate::noise::index_table::IndexTable;
 use crate::packet::{Ip, Packet};
 
+#[cfg(feature = "amnezia")]
+mod amnezia;
 pub mod mock;
 
 /// Assert that the expected number of packets is sent.

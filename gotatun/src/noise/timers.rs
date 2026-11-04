@@ -607,6 +607,7 @@ impl<R: rand::RngCore + Send> Tunn<R> {
 }
 
 #[cfg(feature = "amnezia")]
+#[cfg_attr(not(feature = "device"), allow(dead_code))] // Only the device calls these.
 impl<R: rand::RngCore + Send> Tunn<R> {
     /// Install AmneziaWG timing ranges that [`TimerParams`] cannot express.
     ///
@@ -616,7 +617,6 @@ impl<R: rand::RngCore + Send> Tunn<R> {
     /// rekey-on-receive age are re-drawn at the next handshake and session. A
     /// persistent-keepalive range replaces any fixed interval and draws its first
     /// interval now; removing a range that was set disables persistent keepalive.
-    #[allow(dead_code)] // Wired into the device by later tasks.
     pub(crate) fn set_timer_extras(&mut self, extras: TimerExtras) {
         let had_range = self.timers.extras.persistent_keepalive.is_some();
         self.timers.extras = extras;
