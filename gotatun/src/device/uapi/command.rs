@@ -698,15 +698,21 @@ impl SetPeer {
                     });
                 }
                 "endpoint" => parse_opt!(k, v, endpoint),
+                // Either form may follow the other; the last one wins, as in
+                // amneziawg-go, so a fixed value clears an earlier range and a
+                // range clears an earlier fixed value.
                 #[cfg(feature = "amnezia")]
                 "persistent_keepalive_interval" if v.contains('-') => {
-                    ensure!(
-                        persistent_keepalive_range.is_none()
-                            && persistent_keepalive_interval.is_none(),
-                        "Key {k:?} may not be specified twice",
-                    );
+                    *persistent_keepalive_interval = None;
                     *persistent_keepalive_range = Some(parse_keepalive_range(v)?);
                 }
+                #[cfg(feature = "amnezia")]
+                "persistent_keepalive_interval" => {
+                    *persistent_keepalive_range = None;
+                    *persistent_keepalive_interval =
+                        Some(v.parse().map_err(|e| eyre!("Failed to parse {k:?}: {e}"))?);
+                }
+                #[cfg(not(feature = "amnezia"))]
                 "persistent_keepalive_interval" => parse_opt!(k, v, persistent_keepalive_interval),
                 "remove" => parse_bool!(k, v, remove),
                 "update_only" => parse_bool!(k, v, update_only),

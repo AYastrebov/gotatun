@@ -161,6 +161,24 @@ async fn uapi_peer_keepalive_range() {
             .await
             .contains("persistent_keepalive_interval")
     );
+
+    // Both forms in one peer block: the last line wins, whichever order, as in
+    // amneziawg-go.
+    let set = format!(
+        "set=1\npublic_key={PEER}\npersistent_keepalive_interval=10-20\npersistent_keepalive_interval=5\n"
+    );
+    assert_eq!(errno(&uapi(&client, &set).await), 0);
+    let get = uapi(&client, "get=1\n").await;
+    assert!(get.contains("persistent_keepalive_interval=5\n"), "{get}");
+    let set = format!(
+        "set=1\npublic_key={PEER}\npersistent_keepalive_interval=5\npersistent_keepalive_interval=10-20\n"
+    );
+    assert_eq!(errno(&uapi(&client, &set).await), 0);
+    let get = uapi(&client, "get=1\n").await;
+    assert!(
+        get.contains("persistent_keepalive_interval=10-20\n"),
+        "{get}"
+    );
 }
 
 #[tokio::test]
