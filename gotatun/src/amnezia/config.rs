@@ -102,6 +102,11 @@ pub enum ConfigError {
         /// The required minimum.
         min: u16,
     },
+    /// AmneziaWG was configured together with Phobos, whose server forwards
+    /// to plain WireGuard.
+    #[cfg(feature = "phobos")]
+    #[error("AmneziaWG cannot be combined with Phobos")]
+    CombinedWithPhobos,
 }
 
 /// An inclusive range of message-type header values.

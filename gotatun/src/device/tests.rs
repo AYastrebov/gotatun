@@ -27,6 +27,8 @@ use crate::packet::{Ip, Packet};
 #[cfg(feature = "amnezia")]
 mod amnezia;
 pub mod mock;
+#[cfg(feature = "phobos")]
+mod phobos;
 
 /// Assert that the expected number of packets is sent.
 /// We expect there to be [`packet_count`] data packets, one handshake init,

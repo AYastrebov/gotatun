@@ -53,6 +53,9 @@ pub struct DeviceBuilder<Udp, TunTx, TunRx> {
 
     #[cfg(feature = "amnezia")]
     amnezia: Option<crate::amnezia::AmneziaConfig>,
+
+    #[cfg(feature = "phobos")]
+    phobos: Option<crate::phobos::PhobosHandle>,
 }
 
 impl Default for DeviceBuilder<Nul, Nul, Nul> {
@@ -89,6 +92,8 @@ impl DeviceBuilder<Nul, Nul, Nul> {
             fwmark: None,
             #[cfg(feature = "amnezia")]
             amnezia: None,
+            #[cfg(feature = "phobos")]
+            phobos: None,
         }
     }
 }
@@ -98,6 +103,28 @@ impl<X, Y> DeviceBuilder<Nul, X, Y> {
     /// This is the conventional device kind.
     pub fn with_default_udp(self) -> DeviceBuilder<UdpSocketFactory, X, Y> {
         self.with_udp(UdpSocketFactory::default())
+    }
+
+    /// Like [`with_default_udp`](Self::with_default_udp), with every datagram
+    /// run through the Phobos client for `cfg`.
+    ///
+    /// This wraps the default sockets in a [`PhobosUdpFactory`] and registers
+    /// its handle (see [`with_phobos_handle`](DeviceBuilder::with_phobos_handle)).
+    /// The tunnel MTU must still be lowered by [`Masking::overhead`].
+    ///
+    /// # Errors
+    ///
+    /// Fails if `cfg` does not validate.
+    ///
+    /// [`PhobosUdpFactory`]: crate::phobos::PhobosUdpFactory
+    /// [`Masking::overhead`]: crate::phobos::Masking::overhead
+    #[cfg(feature = "phobos")]
+    pub fn with_phobos(
+        self,
+        cfg: crate::phobos::PhobosConfig,
+    ) -> Result<DeviceBuilder<crate::phobos::PhobosUdpFactory<UdpSocketFactory>, X, Y>, Error> {
+        let (udp, handle) = crate::phobos::PhobosUdpFactory::new(UdpSocketFactory::default(), cfg)?;
+        Ok(self.with_udp(udp).with_phobos_handle(handle))
     }
 
     /// Create a WireGuard device with a custom [`UdpTransportFactory`].
@@ -118,6 +145,8 @@ impl<X, Y> DeviceBuilder<Nul, X, Y> {
             fwmark: self.fwmark,
             #[cfg(feature = "amnezia")]
             amnezia: self.amnezia,
+            #[cfg(feature = "phobos")]
+            phobos: self.phobos,
         }
     }
 }
@@ -196,6 +225,8 @@ impl<X> DeviceBuilder<X, Nul, Nul> {
             fwmark: self.fwmark,
             #[cfg(feature = "amnezia")]
             amnezia: self.amnezia,
+            #[cfg(feature = "phobos")]
+            phobos: self.phobos,
         }
     }
 }
@@ -274,6 +305,22 @@ impl<X, Y, Z> DeviceBuilder<X, Y, Z> {
         self.amnezia = Some(cfg);
         self
     }
+
+    /// Register the handle of a [`PhobosUdpFactory`] the UDP transport was
+    /// built with, for embedders that wrap their own factory.
+    ///
+    /// Through it the transport asks for a handshake initiation after a
+    /// rebind, which the device sends to every peer from its timer loop. A
+    /// Phobos server drops everything else from an address that has not
+    /// completed a handshake, so without the handle a rebound socket stays
+    /// silent until the next rekey.
+    ///
+    /// [`PhobosUdpFactory`]: crate::phobos::PhobosUdpFactory
+    #[cfg(feature = "phobos")]
+    pub fn with_phobos_handle(mut self, handle: crate::phobos::PhobosHandle) -> Self {
+        self.phobos = Some(handle);
+        self
+    }
 }
 
 impl<Udp: UdpTransportFactory, TunTx: IpSend, TunRx: IpRecv> DeviceBuilder<Udp, TunTx, TunRx> {
@@ -291,10 +338,19 @@ impl<Udp: UdpTransportFactory, TunTx: IpSend, TunRx: IpRecv> DeviceBuilder<Udp, 
         feature = "amnezia",
         doc = "Errors if the AmneziaWG configuration is invalid."
     )]
+    #[cfg_attr(
+        all(feature = "amnezia", feature = "phobos"),
+        doc = "Errors if both AmneziaWG and Phobos are configured."
+    )]
     pub async fn build(self) -> Result<Device<(Udp, TunTx, TunRx)>, Error> {
         validate_peers(&self.peers)?;
         #[cfg(feature = "amnezia")]
         let amnezia = super::amnezia::DeviceAmnezia::from_config(self.amnezia)?;
+        // A Phobos server forwards to plain WireGuard.
+        #[cfg(all(feature = "amnezia", feature = "phobos"))]
+        if amnezia.is_some() && self.phobos.is_some() {
+            return Err(crate::amnezia::ConfigError::CombinedWithPhobos.into());
+        }
 
         #[cfg(target_os = "linux")]
         let fwmark = self.fwmark;
@@ -316,6 +372,8 @@ impl<Udp: UdpTransportFactory, TunTx: IpSend, TunRx: IpRecv> DeviceBuilder<Udp, 
             rate_limiter: None,
             #[cfg(feature = "amnezia")]
             amnezia: super::amnezia::AmneziaCell::new(amnezia),
+            #[cfg(feature = "phobos")]
+            phobos: self.phobos,
             port: self.port,
             connection: None,
             suspended: self.suspended,

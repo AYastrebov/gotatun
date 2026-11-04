@@ -108,6 +108,11 @@ pub enum Error {
     #[cfg(feature = "amnezia")]
     #[error("Invalid AmneziaWG configuration: {0}")]
     Amnezia(#[from] crate::amnezia::ConfigError),
+
+    /// The Phobos configuration is invalid
+    #[cfg(feature = "phobos")]
+    #[error("Invalid Phobos configuration: {0}")]
+    Phobos(#[from] crate::phobos::ConfigError),
 }
 
 /// A reference-counted handle to a WireGuard device.
@@ -151,6 +156,10 @@ pub(crate) struct DeviceState<T: DeviceTransports> {
     /// Device-wide AmneziaWG state; `None` is plain WireGuard.
     #[cfg(feature = "amnezia")]
     amnezia: amnezia::AmneziaCell,
+
+    /// Through which a Phobos transport asks for handshake initiations.
+    #[cfg(feature = "phobos")]
+    phobos: Option<crate::phobos::PhobosHandle>,
 
     port: u16,
     udp_factory: T::UdpTransportFactory,
@@ -672,6 +681,14 @@ impl<T: DeviceTransports> DeviceState<T> {
             // TODO: pass in peers instead?
             let peer_map = &device.peers;
 
+            // A rebound Phobos socket carries nothing until an initiation
+            // has gone out on it: start one with every peer.
+            #[cfg(feature = "phobos")]
+            let phobos_initiate = device
+                .phobos
+                .as_ref()
+                .is_some_and(crate::phobos::PhobosHandle::take_initiation_request);
+
             // Go over each peer and invoke the timer function
             for peer in peer_map.values() {
                 let mut p = peer.lock().await;
@@ -680,7 +697,16 @@ impl<T: DeviceTransports> DeviceState<T> {
                     None => continue,
                 };
 
-                match p.update_timers() {
+                #[cfg(feature = "phobos")]
+                let timers = if phobos_initiate {
+                    Ok(p.tunnel.format_handshake_initiation(true).map(WgKind::from))
+                } else {
+                    p.update_timers()
+                };
+                #[cfg(not(feature = "phobos"))]
+                let timers = p.update_timers();
+
+                match timers {
                     Ok(Some(packet)) => {
                         // Register sender_idx from outgoing handshake packets
                         Self::register_handshake_idx(&device.peers_by_idx, &packet, peer);
