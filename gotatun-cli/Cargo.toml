@@ -48,9 +48,11 @@ tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [features]
-default = ["aws-lc-rs"]
+default = ["aws-lc-rs", "amnezia"]
 # Use the `aws-lc-rs` crate as the AEAD backend. Default.
 aws-lc-rs = ["gotatun/aws-lc-rs"]
+# AmneziaWG obfuscation (UAPI keys `jc`, `s1`, `h1`, ...). Default.
+amnezia = ["gotatun/amnezia"]
 # Use jemalloc as allocator instead of system default.
 jemalloc = ["dep:tikv-jemallocator"]
 # Use mimalloc as allocator instead of system default.

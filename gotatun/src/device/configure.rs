@@ -95,6 +95,8 @@ pub struct PeerMut {
     preshared_key: Update<[u8; 32]>,
     endpoint: Update<SocketAddr>,
     keepalive: Update<u16>,
+    #[cfg(feature = "amnezia")]
+    keepalive_range: Update<std::ops::RangeInclusive<u16>>,
     timer_params: Update<TimerParams>,
 
     clear_allowed_ips: bool,
@@ -115,6 +117,16 @@ impl PeerMut {
     /// Set or clear the persistent keepalive interval (in seconds) for this peer.
     pub fn set_keepalive(&mut self, keepalive: Option<u16>) {
         self.keepalive = keepalive.into();
+    }
+
+    /// Set or clear the persistent keepalive interval range (in seconds) for this peer.
+    ///
+    /// A range is re-drawn every time a persistent keepalive fires and replaces any fixed
+    /// interval. Clearing it disables persistent keepalive unless a fixed interval is set in
+    /// the same call.
+    #[cfg(feature = "amnezia")]
+    pub fn set_keepalive_range(&mut self, range: Option<std::ops::RangeInclusive<u16>>) {
+        self.keepalive_range = range.into();
     }
 
     /// Override the WireGuard timer deadlines for this peer, or restore the defaults with `None`.
@@ -205,6 +217,8 @@ impl<T: DeviceTransports> DeviceRead<'_, T> {
                     allowed_ips: p.allowed_ips.iter().map(|(_, net)| net).collect(),
                     endpoint: p.endpoint.addr,
                     keepalive: p.tunnel.persistent_keepalive(),
+                    #[cfg(feature = "amnezia")]
+                    keepalive_range: p.keepalive_range.clone(),
                     #[cfg(feature = "daita")]
                     daita_settings: daita,
                     danger_timer_params: Some(p.tunnel.timer_params().clone()),
@@ -314,6 +328,8 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
             peer_mut.add_allowed_ips(peer.allowed_ips);
             peer_mut.set_endpoint(peer.endpoint);
             peer_mut.set_keepalive(peer.keepalive);
+            #[cfg(feature = "amnezia")]
+            peer_mut.set_keepalive_range(peer.keepalive_range);
             peer_mut.set_preshared_key(peer.preshared_key);
         })
         .await
@@ -358,6 +374,8 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
             add_allowed_ips,
             endpoint,
             keepalive,
+            #[cfg(feature = "amnezia")]
+            keepalive_range,
             timer_params,
         } = peer_mut;
 
@@ -367,6 +385,21 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
 
         if let Update::Set(keepalive) = keepalive {
             existing_peer.tunnel.set_persistent_keepalive(keepalive);
+            #[cfg(feature = "amnezia")]
+            {
+                existing_peer.keepalive_range = None;
+            }
+        }
+
+        // After the fixed interval: a range wins when both are set, and clearing
+        // one only acts if the call did not just replace it.
+        #[cfg(feature = "amnezia")]
+        if let Update::Set(range) = keepalive_range
+            && (range.is_some() || existing_peer.keepalive_range.is_some())
+        {
+            let extras = self.device.amnezia_timer_extras(range.as_ref());
+            existing_peer.tunnel.set_timer_extras(extras);
+            existing_peer.keepalive_range = range;
         }
 
         if let Update::Set(timer_params) = timer_params {

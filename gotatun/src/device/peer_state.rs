@@ -60,6 +60,9 @@ pub struct PeerState {
     /// ranges and are kept when the device's Amnezia config changes.
     #[cfg(feature = "amnezia")]
     pub(crate) danger_timer_params: Option<crate::noise::TimerParams>,
+    /// The peer's persistent keepalive range, if it has one instead of a fixed interval.
+    #[cfg(feature = "amnezia")]
+    pub(crate) keepalive_range: Option<std::ops::RangeInclusive<u16>>,
 }
 
 impl PeerState {
@@ -69,6 +72,7 @@ impl PeerState {
         allowed_ips: &[IpNetwork],
         #[cfg(feature = "daita")] daita_settings: Option<DaitaSettings>,
         #[cfg(feature = "amnezia")] danger_timer_params: Option<crate::noise::TimerParams>,
+        #[cfg(feature = "amnezia")] keepalive_range: Option<std::ops::RangeInclusive<u16>>,
     ) -> PeerState {
         Self {
             tunnel,
@@ -81,6 +85,8 @@ impl PeerState {
             handshake_completed: watch::Sender::new(()),
             #[cfg(feature = "amnezia")]
             danger_timer_params,
+            #[cfg(feature = "amnezia")]
+            keepalive_range,
         }
     }
 

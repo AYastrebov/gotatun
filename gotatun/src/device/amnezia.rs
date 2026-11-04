@@ -6,7 +6,9 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::ops::RangeInclusive;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use tokio::sync::RwLock;
 
@@ -19,7 +21,7 @@ use crate::amnezia::{AmneziaConfig, ConfigError};
 use crate::noise::errors::WireGuardError;
 use crate::noise::index_table::IndexTable;
 use crate::noise::rate_limiter::RateLimiter;
-use crate::noise::{TimerParams, Tunn, TunnResult};
+use crate::noise::{TimerExtras, TimerParams, Tunn, TunnResult};
 use crate::packet::{Packet, WgKind};
 use crate::udp::UdpSend;
 
@@ -225,15 +227,39 @@ impl<T: DeviceTransports> DeviceState<T> {
         &self,
         tunn: &mut Tunn,
         danger_timer_params: Option<&TimerParams>,
+        keepalive_range: Option<&RangeInclusive<u16>>,
     ) {
-        let Some(amnezia) = self.amnezia.load() else {
+        let amnezia = self.amnezia.load();
+        if let Some(amnezia) = &amnezia {
+            tunn.set_amnezia(Some(AmneziaTunnState::new(Arc::clone(&amnezia.cfg))));
+        }
+        // The per-peer keepalive range applies with or without a device config.
+        if amnezia.is_some() || keepalive_range.is_some() {
+            tunn.set_timer_extras(self.amnezia_timer_extras(keepalive_range));
+        }
+        let Some(amnezia) = amnezia else {
             return;
         };
-        tunn.set_amnezia(Some(AmneziaTunnState::new(Arc::clone(&amnezia.cfg))));
-        tunn.set_timer_extras(timer_extras_from(&amnezia.cfg.timings));
         if danger_timer_params.is_none() {
             tunn.dangerously_set_timer_params(timer_params_from(&amnezia.cfg.timings));
         }
+    }
+
+    /// The peer's [`TimerExtras`]: the device-wide ranges plus the peer's
+    /// persistent-keepalive range (seconds).
+    pub(super) fn amnezia_timer_extras(
+        &self,
+        keepalive_range: Option<&RangeInclusive<u16>>,
+    ) -> TimerExtras {
+        let mut extras = self
+            .amnezia
+            .load()
+            .map(|a| timer_extras_from(&a.cfg.timings))
+            .unwrap_or_default();
+        extras.persistent_keepalive = keepalive_range.map(|r| {
+            Duration::from_secs(u64::from(*r.start()))..=Duration::from_secs(u64::from(*r.end()))
+        });
+        extras
     }
 
     /// Record `params` as the peer's explicit timer params and return the
@@ -286,7 +312,11 @@ impl<T: DeviceTransports> DeviceState<T> {
                 if let Some(params) = &peer.danger_timer_params {
                     tunn.dangerously_set_timer_params(params.clone());
                 }
-                self.amnezia_setup_tunn(&mut tunn, peer.danger_timer_params.as_ref());
+                self.amnezia_setup_tunn(
+                    &mut tunn,
+                    peer.danger_timer_params.as_ref(),
+                    peer.keepalive_range.as_ref(),
+                );
                 peer.tunnel = tunn;
             }
         }

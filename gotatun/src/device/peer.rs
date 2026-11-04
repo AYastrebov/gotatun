@@ -38,6 +38,12 @@ pub struct Peer {
     /// Persistent keepalive interval in seconds. Disabled if `None`.
     pub keepalive: Option<u16>,
 
+    /// Persistent keepalive interval range in seconds (AmneziaWG
+    /// `persistent_keepalive_interval=a-b`), re-drawn on every keepalive.
+    /// Takes precedence over [`Self::keepalive`] when set.
+    #[cfg(feature = "amnezia")]
+    pub keepalive_range: Option<std::ops::RangeInclusive<u16>>,
+
     /// DAITA settings for this peer, if the DAITA feature is enabled.
     #[cfg(feature = "daita")]
     pub daita_settings: Option<DaitaSettings>,
@@ -59,6 +65,8 @@ impl Peer {
             allowed_ips: Vec::new(),
             preshared_key: None,
             keepalive: None,
+            #[cfg(feature = "amnezia")]
+            keepalive_range: None,
             #[cfg(feature = "daita")]
             daita_settings: None,
             danger_timer_params: None,
