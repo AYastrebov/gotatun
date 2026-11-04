@@ -263,7 +263,7 @@ impl Default for WgDataHeader {
 impl WgDataHeader {
     /// Overwrite the 4-byte little-endian type field (`packet_type` plus the
     /// reserved bytes) with `v`. AmneziaWG carries its H values here.
-    pub(crate) fn set_wire_type(&mut self, v: u32) {
+    pub fn set_wire_type(&mut self, v: u32) {
         let [t, r0, r1, r2] = v.to_le_bytes();
         self.packet_type = WgPacketType(t);
         self._reserved_zeros = [r0, r1, r2];
@@ -404,7 +404,7 @@ impl Default for WgHandshakeInit {
 impl WgHandshakeInit {
     /// Overwrite the 4-byte little-endian type field (`packet_type` plus the
     /// reserved bytes) with `v`. AmneziaWG carries its H values here.
-    pub(crate) fn set_wire_type(&mut self, v: u32) {
+    pub fn set_wire_type(&mut self, v: u32) {
         let [t, r0, r1, r2] = v.to_le_bytes();
         self.packet_type = WgPacketType(t);
         self._reserved_zeros = [r0, r1, r2];
@@ -488,7 +488,7 @@ impl WgHandshakeBase for WgHandshakeResp {
 impl WgHandshakeResp {
     /// Overwrite the 4-byte little-endian type field (`packet_type` plus the
     /// reserved bytes) with `v`. AmneziaWG carries its H values here.
-    pub(crate) fn set_wire_type(&mut self, v: u32) {
+    pub fn set_wire_type(&mut self, v: u32) {
         let [t, r0, r1, r2] = v.to_le_bytes();
         self.packet_type = WgPacketType(t);
         self._reserved_zeros = [r0, r1, r2];
@@ -538,7 +538,7 @@ impl Default for WgCookieReply {
 impl WgCookieReply {
     /// Overwrite the 4-byte little-endian type field (`packet_type` plus the
     /// reserved bytes) with `v`. AmneziaWG carries its H values here.
-    pub(crate) fn set_wire_type(&mut self, v: u32) {
+    pub fn set_wire_type(&mut self, v: u32) {
         let [t, r0, r1, r2] = v.to_le_bytes();
         self.packet_type = WgPacketType(t);
         self._reserved_zeros = [r0, r1, r2];
@@ -569,13 +569,12 @@ impl Packet {
 }
 
 #[cfg(feature = "amnezia")]
-#[cfg_attr(not(feature = "device"), allow(dead_code))] // Only the device calls these.
 impl Packet {
     /// Cast to a WireGuard packet of an already classified `kind`.
     ///
     /// Applies the same size checks as [`Packet::try_into_wg`] but ignores the
     /// type field, which may still carry an AmneziaWG H value.
-    pub(crate) fn try_into_wg_as(self, kind: WgPacketType) -> eyre::Result<WgKind> {
+    pub fn try_into_wg_as(self, kind: WgPacketType) -> eyre::Result<WgKind> {
         let len = self.as_bytes().len();
         match (kind, len) {
             (WgPacketType::HandshakeInit, WgHandshakeInit::LEN) => {
