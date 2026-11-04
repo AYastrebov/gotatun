@@ -538,7 +538,14 @@ impl<R: UdpRecv, S: UdpSend> PhobosUdpRecv<R, S> {
         Received::WireGuard
     }
 
+    /// Answer a Binding Request, but only from the server the transport
+    /// sends to: answering anyone else would make the client a STUN
+    /// reflector.
     async fn send_reply(&self, reply: &[u8], destination: SocketAddr) {
+        if *self.shared.last_destination.lock() != Some(destination) {
+            tracing::trace!("Dropping Phobos binding request from {destination}");
+            return;
+        }
         if let Err(e) = self
             .reply
             .send_to(Packet::copy_from(reply), destination)
@@ -1116,6 +1123,9 @@ mod tests {
                 let (mut factory, _handle) = factory_on(&net, masking);
                 let (tx, mut rx) = factory.bind(&params()).await.unwrap();
                 let me = tx.local_addr().unwrap().unwrap();
+                // Only the server the client sends to gets an answer.
+                tx.send_to(wg(1, 148), server()).await.unwrap();
+                while tap.try_recv().is_ok() {}
 
                 if masking != Masking::None {
                     srv_ep.send(&srv.binding_request(), me);
@@ -1154,6 +1164,50 @@ mod tests {
                     assert_eq!(success.len(), super::super::BINDING_SUCCESS_LEN);
                     assert_eq!(success[..2], [0x01, 0x01], "Binding Success");
                 }
+            }
+        }
+    }
+
+    /// A Binding Request is answered only when it comes from the server the
+    /// transport sends to; from anyone else it is dropped, so the client is
+    /// no STUN reflector.
+    #[tokio::test]
+    async fn binding_requests_from_strangers_are_dropped() {
+        for masking in [Masking::Stun, Masking::Media] {
+            for batched in [false, true] {
+                let net = Net::default();
+                let mut tap = net.tap();
+                let srv_ep = net.attach(server());
+                let stranger: SocketAddr = "10.0.0.66:5000".parse().unwrap();
+                let stranger_ep = net.attach(stranger);
+                let mut srv = server_codec(masking);
+                let (mut factory, _handle) = factory_on(&net, masking);
+                let (tx, mut rx) = factory.bind(&params()).await.unwrap();
+                let me = tx.local_addr().unwrap().unwrap();
+                tx.send_to(wg(1, 148), server()).await.unwrap();
+                while tap.try_recv().is_ok() {}
+
+                stranger_ep.send(&srv.binding_request(), me);
+                srv_ep.send(&srv.binding_request(), me);
+                let mut out = Vec::new();
+                let _ = srv.wrap(&message(2, 92), &mut out).unwrap();
+                srv_ep.send(&out, me);
+
+                let mut pool = PacketBufPool::new(4);
+                if batched {
+                    let mut got = Vec::new();
+                    rx.recv_many_from(&mut (), &mut pool, &mut got)
+                        .await
+                        .unwrap();
+                } else {
+                    rx.recv_from(&mut pool).await.unwrap();
+                }
+
+                let replies: Vec<_> = std::iter::from_fn(|| tap.try_recv().ok())
+                    .filter(|(source, _, _)| *source == me)
+                    .map(|(_, dst, _)| dst)
+                    .collect();
+                assert_eq!(replies, [server()], "{masking:?} batched={batched}");
             }
         }
     }
