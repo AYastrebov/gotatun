@@ -1357,7 +1357,7 @@ mod tests {
         /// Prefixes come from a deterministic RNG: with trailers on, a
         /// handshake whose prefix happens to decode as H4 would be taken for
         /// transport, and a test must not depend on that 1-in-4000 draw.
-        fn seal(cfg: &Arc<AmneziaConfig>, window: &mut usize, packet: impl Into<WgKind>) -> Packet {
+        fn seal(cfg: &Arc<AmneziaConfig>, window: usize, packet: impl Into<WgKind>) -> Packet {
             let mut out = seal_all(cfg, window, packet);
             out.pop().expect("message datagram")
         }
@@ -1365,7 +1365,7 @@ mod tests {
         /// Every datagram `seal` emits for `packet` (I-packets, junk, message).
         fn seal_all(
             cfg: &Arc<AmneziaConfig>,
-            window: &mut usize,
+            window: usize,
             packet: impl Into<WgKind>,
         ) -> Vec<Packet> {
             thread_local!(static SEED: std::cell::Cell<u8> = const { std::cell::Cell::new(0) });
@@ -1402,7 +1402,7 @@ mod tests {
             let (mut a, mut b) = awg_tuns(&cfg);
 
             let init = create_handshake_init(&mut a);
-            let datagram = seal(&cfg, &mut 500, init);
+            let datagram = seal(&cfg, 500, init);
             let result = deliver(&cfg, &mut b, datagram);
             let TunnResult::WriteToNetwork(WgKind::HandshakeResp(resp)) = result else {
                 panic!("expected a handshake response, got {result:?}");
@@ -1415,7 +1415,7 @@ mod tests {
                 "response type {h} outside H2"
             );
 
-            let datagram = seal(&cfg, &mut 500, resp);
+            let datagram = seal(&cfg, 500, resp);
             let result = deliver(&cfg, &mut a, datagram);
             let TunnResult::WriteToNetwork(WgKind::Data(keepalive)) = result else {
                 panic!("expected a keepalive after the handshake, got {result:?}");
@@ -1465,8 +1465,8 @@ mod tests {
             let (mut a, mut b) = awg_tuns(&cfg);
 
             let init = create_handshake_init(&mut a);
-            let window = a.amnezia_udp_window_mut().expect("amnezia on");
-            assert_eq!(*window, 500);
+            let window = *a.amnezia_udp_window_mut().expect("amnezia on");
+            assert_eq!(window, 500);
             let mut out = seal_all(&cfg, window, init);
             assert_eq!(out.len(), 3, "junk, junk, init");
             let datagram = out.pop().unwrap();
@@ -1479,13 +1479,13 @@ mod tests {
                 panic!("expected a handshake response, got {result:?}");
             };
 
-            let window = b.amnezia_udp_window_mut().unwrap();
+            let window = *b.amnezia_udp_window_mut().unwrap();
             let datagram = seal(&cfg, window, resp);
             let result = deliver(&cfg, &mut a, datagram);
             let TunnResult::WriteToNetwork(keepalive) = result else {
                 panic!("expected a keepalive after the handshake, got {result:?}");
             };
-            let window = a.amnezia_udp_window_mut().unwrap();
+            let window = *a.amnezia_udp_window_mut().unwrap();
             let datagram = seal(&cfg, window, keepalive);
             assert_eq!(
                 datagram.len(),
@@ -1499,7 +1499,7 @@ mod tests {
             let data = a
                 .handle_outgoing_packet(sent.clone().into_bytes(), None)
                 .expect("session should encrypt the packet");
-            let window = a.amnezia_udp_window_mut().unwrap();
+            let window = *a.amnezia_udp_window_mut().unwrap();
             let datagram = seal(&cfg, window, data);
             let TunnResult::WriteToTunnel(received) = deliver(&cfg, &mut b, datagram) else {
                 panic!("session should decrypt the packet");
@@ -1520,7 +1520,7 @@ mod tests {
                     let init = a
                         .format_handshake_initiation(true)
                         .expect("expected handshake init");
-                    let datagram = seal(&cfg, &mut 500, init);
+                    let datagram = seal(&cfg, 500, init);
 
                     // The type field holds H1 rather than 1, and S1 shifts
                     // the message; the plain classifier recognises neither.
