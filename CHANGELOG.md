@@ -23,8 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - See `docs/amnezia.md`.
 
 ### Fixed
-- With the `amnezia` feature, the handshake TAI64N timestamp uses the epoch of kernel WireGuard
-  and amneziawg-go (`2^62 + 10`) instead of `2^62 + 37`, which ran 27 seconds ahead.
+- With the `amnezia` feature compiled in, the handshake TAI64N timestamp uses the epoch of kernel
+  WireGuard and amneziawg-go (`2^62 + 10`) instead of `2^62 + 37`, which ran 27 seconds ahead.
+  This applies to plain WireGuard tunnels too. After upgrading, a peer that saw the old stamps
+  from the same key rejects initiations as replays for up to 27 seconds.
 - Fix the mock UDP channel's IPv6 flow label overflowing 20 bits in tests.
 
 
