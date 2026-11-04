@@ -77,6 +77,7 @@ impl Deobfuscator {
     /// bytes at offset S4 happen to fall in the H4 range (|H4| / 2^32 of
     /// them) is first taken for transport. Its "receiver index" is then
     /// random, so the receiver asks for this second reading (ruling R14).
+    #[cfg(test)]
     pub(crate) fn reclassify_handshake(
         &self,
         src: &[u8],
@@ -91,6 +92,17 @@ impl Deobfuscator {
         mask: Option<[u8; HEADER_PROTECTION_MASK_LEN]>,
         with_transport: bool,
     ) -> Option<Classified> {
+        self.matches(src, mask, with_transport).next()
+    }
+
+    /// Every reading of `src` that passes its size and H-range test, in the
+    /// classifier's order. Lazy: [`Deobfuscator::classify`] takes the first.
+    fn matches<'a>(
+        &'a self,
+        src: &'a [u8],
+        mask: Option<[u8; HEADER_PROTECTION_MASK_LEN]>,
+        with_transport: bool,
+    ) -> impl Iterator<Item = Classified> + 'a {
         let cfg = &*self.cfg;
         let p = &cfg.padding;
         let h = &cfg.headers;
@@ -141,8 +153,8 @@ impl Deobfuscator {
 
         candidates
             .into_iter()
-            .filter(|c| with_transport || c.kind != WgPacketType::Data)
-            .find_map(|c| {
+            .filter(move |c| with_transport || c.kind != WgPacketType::Data)
+            .filter_map(move |c| {
                 let min_len = c.prefix.checked_add(c.size)?;
                 let size_ok = if c.fixed && !cfg.random_trailers {
                     src.len() == min_len
@@ -176,31 +188,61 @@ impl Deobfuscator {
     /// bytes. Returns `None` (drop silently) for junk, I-packets and garbage.
     #[cfg(test)]
     pub(crate) fn open(&self, packet: Packet) -> Option<(Packet, WgPacketType)> {
-        self.open_with(packet, |_| true)
+        self.open_with(packet, |_| true, |_, _| true)
     }
 
     /// [`Deobfuscator::open`], for a receiver that can tell whether a
-    /// transport receiver index is one of its own (`known_idx`).
+    /// transport receiver index is one of its own (`known_idx`) and whether
+    /// a handshake message's MAC1 verifies (`mac1_ok`, given the kind and the
+    /// unprotected message).
     ///
-    /// With AWG 3.1 trailers a datagram that classifies as transport but
-    /// carries an unknown receiver index is classified again as a handshake
-    /// type (see [`Deobfuscator::reclassify_handshake`]); if it is one, that
-    /// reading wins. `known_idx` is asked only with trailers on, before
-    /// anything is modified, so no copy is kept.
+    /// With AWG 3.1 trailers the size tests are `>=`, so a datagram can pass
+    /// several readings; only the first is taken, unless it is clearly wrong:
+    /// - transport with an unknown receiver index (ruling R14): it was a
+    ///   handshake whose bytes at S4 fell in H4, read it as one;
+    /// - several handshake readings (ruling R15; a trailered response passes
+    ///   the init test |H1| / 2^32 of the time): take the first whose MAC1
+    ///   verifies, a cookie reply having none.
+    ///
+    /// Both checks run before anything is modified and only when a datagram
+    /// is ambiguous, so valid traffic pays no MAC and no copy. Without
+    /// trailers sizes are exact and the first reading is taken.
     pub(crate) fn open_with(
         &self,
         packet: Packet,
         known_idx: impl FnOnce(u32) -> bool,
+        mut mac1_ok: impl FnMut(WgPacketType, &[u8]) -> bool,
     ) -> Option<(Packet, WgPacketType)> {
-        let mut c = self.classify(&packet)?;
-        if c.kind == WgPacketType::Data
-            && self.cfg.random_trailers
-            && !known_idx(transport_receiver_idx(&packet, &c))
-            && let Some(handshake) = self.reclassify_handshake(&packet, &c)
+        let first = self.classify(&packet)?;
+        if !self.cfg.random_trailers
+            || (first.kind == WgPacketType::Data
+                && known_idx(transport_receiver_idx(&packet, &first)))
         {
-            c = handshake;
+            return Some(self.open_classified(packet, first));
         }
-        Some(self.open_classified(packet, c))
+
+        let mut readings = [None; 3];
+        for (slot, c) in readings
+            .iter_mut()
+            .zip(self.matches(&packet, first.mask, false))
+        {
+            *slot = Some(c);
+        }
+        let chosen = match readings {
+            // Transport with an unknown index and no handshake reading: keep
+            // it; no session takes it.
+            [None, ..] => first,
+            [Some(only), None, _] => only,
+            [Some(head), ..] => readings
+                .into_iter()
+                .flatten()
+                .find(|c| {
+                    c.kind == WgPacketType::CookieReply
+                        || mac1_ok(c.kind, &unprotected_message(&packet, c))
+                })
+                .unwrap_or(head),
+        };
+        Some(self.open_classified(packet, chosen))
     }
 
     fn open_classified(&self, mut packet: Packet, c: Classified) -> (Packet, WgPacketType) {
@@ -216,6 +258,21 @@ impl Deobfuscator {
         }
         (packet, c.kind)
     }
+}
+
+/// The message of a handshake-type reading `c`, prefix and trailer removed
+/// and header protection undone, as a copy (for the MAC1 check of an
+/// ambiguous datagram).
+fn unprotected_message(src: &[u8], c: &Classified) -> Vec<u8> {
+    let size = c.msg_size.unwrap_or(src.len() - c.prefix);
+    let mut msg = src[c.prefix..c.prefix + size].to_vec();
+    if let Some(mask) = &c.mask {
+        let n = c.protected_len.min(msg.len());
+        for (b, m) in msg[..n].iter_mut().zip(mask) {
+            *b ^= m;
+        }
+    }
+    msg
 }
 
 /// The receiver index of a datagram classified as transport, unprotected.
@@ -547,11 +604,90 @@ mod tests {
 
                 // A known index keeps the transport reading; an unknown one
                 // takes the handshake reading, opened intact.
-                let (_, got) = deob.open_with(packet(&datagram), |_| true).unwrap();
+                let (_, got) = deob
+                    .open_with(packet(&datagram), |_| true, |_, _| true)
+                    .unwrap();
                 assert_eq!(got, WgPacketType::Data);
-                let (opened, got) = deob.open_with(packet(&datagram), |_| false).unwrap();
+                let (opened, got) = deob
+                    .open_with(packet(&datagram), |_| false, |_, _| true)
+                    .unwrap();
                 assert_eq!(got, kind);
                 assert_eq!(&opened[4..], &msg[4..], "{kind:?}: body");
+            }
+        }
+    }
+
+    /// R15: with trailers on, a response or cookie reply can pass the init
+    /// test (size `>=` S1 + 148, bytes at S1 in H1). The init reading fails
+    /// MAC1, so the next handshake reading that verifies wins; a cookie reply
+    /// has no MAC1 and is taken as is.
+    #[test]
+    fn handshake_misread_as_other_handshake_is_recovered() {
+        for hp in [false, true] {
+            let mut cfg = awg_cfg(hp, true);
+            // Wide H1 so the misreading is common enough to find quickly.
+            cfg.headers.init = HeaderRange {
+                start: 10_000_000,
+                end: 4_000_000_000,
+            };
+            let deob = Deobfuscator::new(Arc::new(cfg.clone()));
+            for (kind, len) in [
+                (WgPacketType::HandshakeResp, WgHandshakeResp::LEN),
+                (WgPacketType::CookieReply, WgCookieReply::LEN),
+            ] {
+                let msg = wg_message(kind, len);
+                let datagram = (0..)
+                    .map(|seed| seal(&cfg, kind, &msg, 500, &mut DetRng::new(seed)))
+                    .find(|d| deob.classify(d).map(|c| c.kind) == Some(WgPacketType::HandshakeInit))
+                    .expect("some datagram is read as an init first");
+
+                // Taking the first reading gets it wrong ...
+                let (_, got) = deob
+                    .open_with(packet(&datagram), |_| false, |_, _| true)
+                    .unwrap();
+                assert_eq!(got, WgPacketType::HandshakeInit, "hp={hp}");
+
+                // ... a MAC1 check walks on to the true kind, opened intact.
+                let mut asked = vec![];
+                let (opened, got) = deob
+                    .open_with(
+                        packet(&datagram),
+                        |_| false,
+                        |k, m| {
+                            asked.push(k);
+                            k == kind && m[4..] == msg[4..]
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(got, kind, "hp={hp}");
+                assert_eq!(&opened[4..], &msg[4..], "{kind:?}: message");
+                assert_eq!(asked[0], WgPacketType::HandshakeInit);
+                assert!(!asked.contains(&WgPacketType::CookieReply), "no MAC1 asked");
+            }
+        }
+    }
+
+    /// Valid unambiguous traffic pays no MAC check and no index lookup
+    /// without trailers.
+    #[test]
+    fn unambiguous_datagrams_skip_the_checks() {
+        for trailers in [false, true] {
+            let cfg = awg_cfg(true, trailers);
+            let deob = Deobfuscator::new(Arc::new(cfg.clone()));
+            for (kind, len) in kinds() {
+                let msg = wg_message(kind, len);
+                let datagram = seal(&cfg, kind, &msg, 500, &mut DetRng::new(5));
+                let (_, got) = deob
+                    .open_with(
+                        packet(&datagram),
+                        |_| {
+                            assert!(trailers, "index asked without trailers");
+                            true
+                        },
+                        |_, _| panic!("MAC1 asked for an unambiguous {kind:?}"),
+                    )
+                    .unwrap();
+                assert_eq!(got, kind);
             }
         }
     }

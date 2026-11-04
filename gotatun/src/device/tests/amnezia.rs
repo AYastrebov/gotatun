@@ -145,12 +145,7 @@ async fn drain<S: Stream<Item = Packet>>(stream: S, idle: Duration) -> Vec<Packe
 async fn ping(from: &MockDevice, to: &mut MockDevice, payload: &[u8]) {
     let packet = mock::packet(payload);
     from.app_tx.send(packet.clone()).await;
-    // Under `mock_instant` retries only fire if the test advances the clock.
-    // One is still sometimes needed: with AWG 3.1 trailers a handshake
-    // response is read as an initiation |H1| / 2^32 of the time (about 1%
-    // here), fails MAC1 and is dropped; ruling R14 only recovers handshakes
-    // misread as transport.
-    let got = with_running_clock(timeout(Duration::from_secs(10), to.app_rx.recv()))
+    let got = timeout(Duration::from_secs(10), to.app_rx.recv())
         .await
         .expect("packet should be delivered");
     assert_eq!(got.as_bytes(), packet.as_bytes());
@@ -438,7 +433,9 @@ async fn cookie_under_load_has_trailer_and_handshake_completes() {
         let to_alice = sent_to(&eve, ALICE_V4.into());
         let (datagrams, ()) = tokio::join!(
             drain(to_alice, Duration::from_millis(1500)),
-            ping(&alice, &mut bob, b"after the cookie"),
+            // The initiator retries with MAC2 only after its rekey timeout,
+            // which under `mock_instant` needs the clock advanced.
+            with_running_clock(ping(&alice, &mut bob, b"after the cookie")),
         );
         let cookies: Vec<_> = datagrams
             .iter()
@@ -800,10 +797,6 @@ async fn misread_handshakes_complete_without_retry() {
     let mut cfg = awg31();
     cfg.headers.transport = range(2_000_000_000, 4_200_000_000);
     cfg.timings.rekey_timeout = secs(5, 6);
-    // Keep this test to the transport misreading: a trailered response can
-    // also be read as an init (|H1| / 2^32), which R14 does not cover. With
-    // S1 + 148 above the 500-byte window, no response is long enough for that.
-    cfg.padding.s1 = 360;
     let deobfs = Deobfuscator::new(Arc::new(cfg.clone()));
 
     let mut misread = 0;
@@ -837,5 +830,45 @@ async fn misread_handshakes_complete_without_retry() {
     assert!(
         misread > 0,
         "no handshake was misread first; the test lost its point"
+    );
+}
+
+/// R15: with trailers on, a handshake response long enough for the init test
+/// (S1 + 148) whose bytes at S1 fall in H1 is first read as an initiation;
+/// that reading fails MAC1 and the response reading wins, so every handshake
+/// completes on the first try. H1 here covers half of all u32 values.
+#[tokio::test]
+#[test_log::test]
+async fn responses_misread_as_init_complete_without_retry() {
+    let mut cfg = awg31();
+    cfg.headers.init = range(2_000_000_000, 4_200_000_000);
+    cfg.timings.rekey_timeout = secs(5, 6);
+    assert!(usize::from(cfg.padding.s2) + 92 >= usize::from(cfg.padding.s1) + 148);
+    let deobfs = Deobfuscator::new(Arc::new(cfg.clone()));
+
+    let mut misread = 0;
+    for _ in 0..6 {
+        let (alice, _bob, eve) = awg_pair(cfg.clone()).await;
+        let bob_key = alice.device.peers().await[0].peer.public_key;
+        let to_alice = sent_to(&eve, ALICE_V4.into());
+        let (datagrams, done) = tokio::join!(
+            drain(to_alice, Duration::from_millis(300)),
+            timeout(
+                Duration::from_secs(2),
+                alice.device.force_handshake(&bob_key)
+            ),
+        );
+        done.expect("handshake completes without a retry")
+            .expect("peer exists");
+        // Only Bob's response goes to Alice before the session; an "init"
+        // reading of it is the misreading.
+        misread += datagrams
+            .iter()
+            .filter(|d| deobfs.classify(d).map(|c| c.kind) == Some(WgPacketType::HandshakeInit))
+            .count();
+    }
+    assert!(
+        misread > 0,
+        "no response was misread first; the test lost its point"
     );
 }

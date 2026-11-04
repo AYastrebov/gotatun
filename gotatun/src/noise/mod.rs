@@ -1452,8 +1452,19 @@ mod tests {
         /// over the raw bytes (H included), then hand the plain message to
         /// `to`.
         fn deliver(cfg: &Arc<AmneziaConfig>, to: &mut Tunn, datagram: Packet) -> TunnResult {
+            // Resolve ambiguous trailered datagrams as the device does
+            // (rulings R14/R15): `to`'s sessions and MAC1 key are the oracle.
             let (packet, kind) = Deobfuscator::new(cfg.clone())
-                .open(datagram)
+                .open_with(
+                    datagram,
+                    |idx| {
+                        to.sessions
+                            .iter()
+                            .flatten()
+                            .any(|s| s.receiving_index.value() == idx)
+                    },
+                    |_, msg| to.rate_limiter.mac1_matches(msg),
+                )
                 .expect("datagram classifies");
             match to
                 .rate_limiter
