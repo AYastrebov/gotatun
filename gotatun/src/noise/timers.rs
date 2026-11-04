@@ -104,6 +104,31 @@ impl Default for TimerParams {
     }
 }
 
+/// AmneziaWG 3.0 timing ranges that [`TimerParams`] has no field for.
+///
+/// Kept apart from [`TimerParams`] so its public API stays unchanged. `None` keeps
+/// the WireGuard constant, so `TimerExtras::default()` is plain WireGuard. Built
+/// from the device's `TimingRanges` by `amnezia::timers::timer_extras_from` and
+/// installed with [`Tunn::set_timer_extras`].
+#[cfg(feature = "amnezia")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TimerExtras {
+    /// Keypair expiry and key zeroing (`* 3`) use `Hi` of this range
+    /// (amneziawg-go `keychainExpireTime`).
+    pub(crate) reject_after_time: Option<RangeInclusive<Duration>>,
+    /// Bounds handshake retries to `pick(rekey_timeout) * pick(attempts)`, drawn
+    /// when a new handshake starts, instead of `REKEY_ATTEMPT_TIME`.
+    pub(crate) max_handshake_attempts: Option<RangeInclusive<u32>>,
+    /// Persistent keepalive interval, re-drawn in whole seconds (as amneziawg-go
+    /// `PickOne`) each time a persistent keepalive fires.
+    pub(crate) persistent_keepalive: Option<RangeInclusive<Duration>>,
+    /// Session age at which the initiator rekeys after receiving data:
+    /// `pick(reject) - Lo(keepalive) - Lo(rekey)` (amneziawg-go
+    /// `keyRefreshTimeoutReceiving`). Sampled when a session is established, like
+    /// [`TimerParams::rekey_after_time`].
+    pub(crate) rekey_after_receive: Option<RangeInclusive<Duration>>,
+}
+
 #[derive(Debug)]
 pub struct Timers {
     /// Is the owner of the timer the initiator or the responder for the last handshake?
@@ -133,6 +158,15 @@ pub struct Timers {
     /// Current rekey-after-time deadline.
     /// Sampled from [`TimerParams::rekey_after_time`] when a session is established.
     rekey_after_time: Duration,
+    /// AmneziaWG timing ranges with no [`TimerParams`] field.
+    #[cfg(feature = "amnezia")]
+    extras: TimerExtras,
+    /// Current handshake give-up budget. Drawn when a handshake starts.
+    #[cfg(feature = "amnezia")]
+    rekey_attempt_time: Duration,
+    /// Current initiator rekey-on-receive age. Drawn when a session is established.
+    #[cfg(feature = "amnezia")]
+    rekey_after_receive: Duration,
 }
 
 impl Timers {
@@ -154,6 +188,12 @@ impl Timers {
             new_handshake_timeout: Duration::ZERO,
             rekey_timeout: Duration::ZERO,
             rekey_after_time: Duration::ZERO,
+            #[cfg(feature = "amnezia")]
+            extras: TimerExtras::default(),
+            #[cfg(feature = "amnezia")]
+            rekey_attempt_time: REKEY_ATTEMPT_TIME,
+            #[cfg(feature = "amnezia")]
+            rekey_after_receive: REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT,
         };
         timers.dangerously_set_params(TimerParams::default());
         timers
@@ -195,6 +235,45 @@ impl Timers {
             .checked_duration_since(self.time_started)
             .unwrap_or(Duration::ZERO)
             .max(self[TimeCurrent])
+    }
+
+    /// Session age after which keys are rejected.
+    #[cfg(not(feature = "amnezia"))]
+    fn reject_after_time(&self) -> Duration {
+        REJECT_AFTER_TIME
+    }
+
+    /// Session age after which keys are rejected: `Hi(reject_after_time)`.
+    #[cfg(feature = "amnezia")]
+    fn reject_after_time(&self) -> Duration {
+        self.extras
+            .reject_after_time
+            .as_ref()
+            .map_or(REJECT_AFTER_TIME, |r| *r.end())
+    }
+
+    /// How long handshake retries go on before giving up.
+    #[cfg(not(feature = "amnezia"))]
+    fn rekey_attempt_time(&self) -> Duration {
+        REKEY_ATTEMPT_TIME
+    }
+
+    /// How long handshake retries go on before giving up.
+    #[cfg(feature = "amnezia")]
+    fn rekey_attempt_time(&self) -> Duration {
+        self.rekey_attempt_time
+    }
+
+    /// Session age at which the initiator rekeys after receiving data.
+    #[cfg(not(feature = "amnezia"))]
+    fn rekey_after_receive(&self) -> Duration {
+        REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT
+    }
+
+    /// Session age at which the initiator rekeys after receiving data.
+    #[cfg(feature = "amnezia")]
+    fn rekey_after_receive(&self) -> Duration {
+        self.rekey_after_receive
     }
 }
 
@@ -244,6 +323,8 @@ impl<R: rand::RngCore + Send> Tunn<R> {
                 self.timers.new_handshake_timeout = self.sample_timer(|p| &p.new_handshake_timeout);
                 self.timers.want_handshake = Some(time);
             }
+            #[cfg(feature = "amnezia")]
+            TimeLastHandshakeStarted => self.amnezia_handshake_started(),
             _ => {}
         }
 
@@ -274,6 +355,8 @@ impl<R: rand::RngCore + Send> Tunn<R> {
             self.timers[TimeCurrent];
         self.timers.is_initiator = is_initiator;
         self.timers.rekey_after_time = self.sample_timer(|p| &p.rekey_after_time);
+        #[cfg(feature = "amnezia")]
+        self.amnezia_session_established();
     }
 
     // We don't really clear the timers, but we set them to the current time to
@@ -290,9 +373,10 @@ impl<R: rand::RngCore + Send> Tunn<R> {
 
     fn update_session_timers(&mut self, time_now: Duration) {
         let timers = &mut self.timers;
+        let reject_after_time = timers.reject_after_time();
 
         for (i, t) in timers.session_timers.iter_mut().enumerate() {
-            if time_now - *t > REJECT_AFTER_TIME {
+            if time_now - *t > reject_after_time {
                 // Forget about expired sessions
                 if let Some(session) = self.sessions[i].take() {
                     tracing::trace!(
@@ -343,7 +427,7 @@ impl<R: rand::RngCore + Send> Tunn<R> {
 
             // All ephemeral private keys and symmetric session keys are zeroed out after
             // (REJECT_AFTER_TIME * 3) ms if no new keys have been exchanged.
-            if now - session_established >= REJECT_AFTER_TIME * 3 {
+            if now - session_established >= self.timers.reject_after_time() * 3 {
                 tracing::trace!("CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)");
                 self.handshake.set_expired();
                 self.clear_all();
@@ -352,7 +436,7 @@ impl<R: rand::RngCore + Send> Tunn<R> {
 
             if let Some(time_init_sent) = self.handshake.timer() {
                 // Handshake Initiation Retransmission
-                if now - handshake_started >= REKEY_ATTEMPT_TIME {
+                if now - handshake_started >= self.timers.rekey_attempt_time() {
                     // After REKEY_ATTEMPT_TIME ms of trying to initiate a new handshake,
                     // the retries give up and cease, and clear all existing packets queued
                     // up to be sent. If a packet is explicitly queued up to be sent, then
@@ -390,8 +474,7 @@ impl<R: rand::RngCore + Send> Tunn<R> {
                     // - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT ms old, we initiate a new
                     // handshake.
                     if session_established < data_packet_received
-                        && now - session_established
-                            >= REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT
+                        && now - session_established >= self.timers.rekey_after_receive()
                     {
                         tracing::trace!(
                             "HANDSHAKE(REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - \
@@ -434,6 +517,8 @@ impl<R: rand::RngCore + Send> Tunn<R> {
                         tracing::trace!("KEEPALIVE(PERSISTENT_KEEPALIVE)");
                         self.timers.persistent_keepalive_due = false;
                         self.timer_tick(TimePersistentKeepalive);
+                        #[cfg(feature = "amnezia")]
+                        self.amnezia_persistent_keepalive_fired();
                         keepalive_required = true;
                     }
                 }
@@ -504,6 +589,10 @@ impl<R: rand::RngCore + Send> Tunn<R> {
     /// Pass `None` or `Some(0)` to disable persistent keepalive.
     pub fn set_persistent_keepalive(&mut self, seconds: Option<u16>) {
         let was_enabled = self.timers.persistent_keepalive.is_some();
+        #[cfg(feature = "amnezia")]
+        {
+            self.timers.extras.persistent_keepalive = None;
+        }
         self.timers.persistent_keepalive = seconds
             .filter(|&s| s > 0)
             .map(|s| Duration::from_secs(s.into()));
@@ -514,5 +603,288 @@ impl<R: rand::RngCore + Send> Tunn<R> {
         } else {
             self.timers[TimePersistentKeepalive] = self.timers[TimeCurrent];
         }
+    }
+}
+
+#[cfg(feature = "amnezia")]
+impl<R: rand::RngCore + Send> Tunn<R> {
+    /// Install AmneziaWG timing ranges that [`TimerParams`] cannot express.
+    ///
+    /// The device calls this when it builds a peer's `Tunn` (with
+    /// `amnezia::timers::timer_extras_from` for the device-wide ranges, plus the
+    /// peer's persistent-keepalive range). The give-up budget and the
+    /// rekey-on-receive age are re-drawn at the next handshake and session. A
+    /// persistent-keepalive range replaces any fixed interval and draws its first
+    /// interval now; removing a range that was set disables persistent keepalive.
+    #[allow(dead_code)] // Wired into the device by later tasks.
+    pub(crate) fn set_timer_extras(&mut self, extras: TimerExtras) {
+        let had_range = self.timers.extras.persistent_keepalive.is_some();
+        self.timers.extras = extras;
+        self.timers.rekey_attempt_time = REKEY_ATTEMPT_TIME;
+        self.timers.rekey_after_receive = REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT;
+
+        let was_enabled = self.timers.persistent_keepalive.is_some();
+        if self.timers.extras.persistent_keepalive.is_some() {
+            self.timers.persistent_keepalive = Some(self.pick_persistent_keepalive());
+        } else if had_range {
+            self.timers.persistent_keepalive = None;
+        } else {
+            return;
+        }
+        self.timers.persistent_keepalive_due = self.timers.persistent_keepalive.is_some()
+            && (self.timers.persistent_keepalive_due || !was_enabled);
+        self.timers[TimePersistentKeepalive] = if self.timers.persistent_keepalive.is_some() {
+            self.timers[TimeCurrent]
+        } else {
+            Duration::ZERO
+        };
+    }
+
+    /// A new handshake started: draw its give-up budget.
+    fn amnezia_handshake_started(&mut self) {
+        self.timers.rekey_attempt_time = match self.timers.extras.max_handshake_attempts.clone() {
+            Some(attempts) => {
+                let attempts = if attempts.start() >= attempts.end() {
+                    *attempts.start()
+                } else {
+                    self.jitter_rng.random_range(attempts)
+                };
+                // Zero attempts would give up before the first retransmit.
+                self.sample_timer(|p| &p.rekey_timeout) * attempts.max(1)
+            }
+            None => REKEY_ATTEMPT_TIME,
+        };
+    }
+
+    /// A session was established: draw its rekey-on-receive age.
+    fn amnezia_session_established(&mut self) {
+        self.timers.rekey_after_receive = match self.timers.extras.rekey_after_receive.clone() {
+            Some(range) if range.start() < range.end() => self.jitter_rng.random_range(range),
+            Some(range) => *range.start(),
+            None => REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT,
+        };
+    }
+
+    /// A persistent keepalive fired: draw the next interval from the range, if any.
+    fn amnezia_persistent_keepalive_fired(&mut self) {
+        if self.timers.extras.persistent_keepalive.is_some() {
+            self.timers.persistent_keepalive = Some(self.pick_persistent_keepalive());
+        }
+    }
+
+    /// Whole seconds from the persistent-keepalive range, at least one second
+    /// (zero would mean "always due").
+    fn pick_persistent_keepalive(&mut self) -> Duration {
+        let Some(range) = self.timers.extras.persistent_keepalive.as_ref() else {
+            return Duration::ZERO;
+        };
+        let (lo, hi) = (range.start().as_secs(), range.end().as_secs());
+        let secs = if lo >= hi {
+            lo
+        } else {
+            self.jitter_rng.random_range(lo..=hi)
+        };
+        Duration::from_secs(secs.max(1))
+    }
+}
+
+#[cfg(all(test, feature = "amnezia"))]
+mod amnezia_tests {
+    use std::sync::Arc;
+
+    #[cfg(feature = "mock_instant")]
+    use mock_instant::thread_local::MockClock;
+
+    use super::*;
+    use crate::amnezia::TimingRanges;
+    use crate::amnezia::timers::{timer_extras_from, timer_params_from};
+    #[cfg(feature = "mock_instant")]
+    use crate::noise::TunnResult;
+    use crate::noise::index_table::IndexTable;
+    use crate::noise::rate_limiter::RateLimiter;
+    use crate::x25519;
+
+    fn secs(lo: u64, hi: u64) -> RangeInclusive<Duration> {
+        Duration::from_secs(lo)..=Duration::from_secs(hi)
+    }
+
+    fn two_tuns() -> (Tunn, Tunn) {
+        let my_secret = x25519::StaticSecret::random_from_rng(rand_core::OsRng);
+        let my_public = x25519::PublicKey::from(&my_secret);
+        let their_secret = x25519::StaticSecret::random_from_rng(rand_core::OsRng);
+        let their_public = x25519::PublicKey::from(&their_secret);
+        let mine = Tunn::new(
+            my_secret,
+            their_public,
+            None,
+            None,
+            IndexTable::from_os_rng(),
+            Arc::new(RateLimiter::new(&my_public, 100)),
+        );
+        let theirs = Tunn::new(
+            their_secret,
+            my_public,
+            None,
+            None,
+            IndexTable::from_os_rng(),
+            Arc::new(RateLimiter::new(&their_public, 100)),
+        );
+        (mine, theirs)
+    }
+
+    #[cfg(feature = "mock_instant")]
+    fn handshake(mine: &mut Tunn, theirs: &mut Tunn) {
+        let init = mine.format_handshake_initiation(false).expect("init");
+        let TunnResult::WriteToNetwork(resp) = theirs.handle_incoming_packet(init.into()) else {
+            panic!("expected a handshake response");
+        };
+        let TunnResult::WriteToNetwork(WgKind::Data(keepalive)) = mine.handle_incoming_packet(resp)
+        else {
+            panic!("expected a keepalive after the handshake");
+        };
+        let result = theirs.handle_incoming_packet(WgKind::Data(keepalive));
+        assert!(matches!(result, TunnResult::WriteToTunnel(p) if p.is_empty()));
+    }
+
+    #[cfg(feature = "mock_instant")]
+    fn has_current_session(tun: &Tunn) -> bool {
+        tun.sessions[tun.current % crate::noise::N_SESSIONS].is_some()
+    }
+
+    /// `max_handshake_attempts` bounds retries to `pick(rekey_timeout) * attempts`
+    /// instead of `REKEY_ATTEMPT_TIME` (90 s).
+    #[test]
+    #[cfg(feature = "mock_instant")]
+    fn max_attempts_bounds_retries() {
+        let (mut mine, _theirs) = two_tuns();
+        mine.dangerously_set_timer_params(TimerParams {
+            rekey_timeout: secs(5, 5),
+            ..TimerParams::default()
+        });
+        mine.set_timer_extras(TimerExtras {
+            max_handshake_attempts: Some(3..=3),
+            ..TimerExtras::default()
+        });
+        mine.format_handshake_initiation(false).expect("init");
+
+        let mut elapsed = Duration::ZERO;
+        let gave_up_at = loop {
+            MockClock::advance(Duration::from_secs(1));
+            elapsed += Duration::from_secs(1);
+            match mine.update_timers() {
+                Err(WireGuardError::ConnectionExpired) => break elapsed,
+                Ok(_) => assert!(elapsed < REKEY_ATTEMPT_TIME, "never gave up"),
+                Err(e) => panic!("unexpected error {e:?}"),
+            }
+        };
+        assert_eq!(gave_up_at, Duration::from_secs(15));
+    }
+
+    /// Key expiry follows `Hi(reject_after_time)`, not the 180 s constant.
+    #[test]
+    #[cfg(feature = "mock_instant")]
+    fn reject_after_uses_hi() {
+        let (mut mine, mut theirs) = two_tuns();
+        mine.set_timer_extras(TimerExtras {
+            reject_after_time: Some(secs(200, 300)),
+            ..TimerExtras::default()
+        });
+        handshake(&mut mine, &mut theirs);
+        assert!(has_current_session(&mine));
+
+        MockClock::advance(Duration::from_secs(250));
+        assert!(mine.update_timers().is_ok());
+        assert!(has_current_session(&mine), "expired before Hi(reject)");
+
+        MockClock::advance(Duration::from_secs(51));
+        assert!(mine.update_timers().is_ok());
+        assert!(!has_current_session(&mine), "kept past Hi(reject)");
+
+        // Key material is zeroed after Hi(reject) * 3, not REJECT_AFTER_TIME * 3.
+        assert_eq!(
+            mine.timers.reject_after_time() * 3,
+            Duration::from_secs(900)
+        );
+    }
+
+    /// The persistent-keepalive interval is re-drawn from its range on every fire.
+    #[test]
+    #[cfg(feature = "mock_instant")]
+    fn persistent_keepalive_range_redrawn() {
+        let (mut mine, mut theirs) = two_tuns();
+        handshake(&mut mine, &mut theirs);
+        mine.set_timer_extras(TimerExtras {
+            persistent_keepalive: Some(secs(2, 9)),
+            ..TimerExtras::default()
+        });
+
+        let mut intervals = Vec::new();
+        let mut since_last = Duration::ZERO;
+        let mut fired = 0;
+        for _ in 0..200 {
+            MockClock::advance(Duration::from_secs(1));
+            since_last += Duration::from_secs(1);
+            let interval = mine.timers.persistent_keepalive.expect("enabled");
+            assert!(secs(2, 9).contains(&interval), "{interval:?} out of range");
+            if let Ok(Some(WgKind::Data(_))) = mine.update_timers() {
+                // The first keepalive is due immediately; later ones wait their interval.
+                if fired > 0 {
+                    assert_eq!(since_last, interval);
+                }
+                fired += 1;
+                since_last = Duration::ZERO;
+                intervals.push(mine.timers.persistent_keepalive.expect("enabled"));
+            }
+        }
+        assert!(fired > 20, "only {fired} keepalives");
+        intervals.sort();
+        intervals.dedup();
+        assert!(
+            intervals.len() > 1,
+            "interval never re-drawn: {intervals:?}"
+        );
+    }
+
+    /// A fixed interval set afterwards replaces the range: no more re-draws.
+    #[test]
+    fn fixed_keepalive_replaces_range() {
+        let (mut mine, _theirs) = two_tuns();
+        mine.set_timer_extras(TimerExtras {
+            persistent_keepalive: Some(secs(2, 9)),
+            ..TimerExtras::default()
+        });
+        assert!(mine.timers.persistent_keepalive.is_some());
+        mine.set_persistent_keepalive(Some(25));
+        assert_eq!(mine.timers.extras.persistent_keepalive, None);
+        mine.amnezia_persistent_keepalive_fired();
+        assert_eq!(mine.persistent_keepalive(), Some(25));
+
+        // Removing a range that was set disables persistent keepalive.
+        mine.set_timer_extras(TimerExtras {
+            persistent_keepalive: Some(secs(2, 9)),
+            ..TimerExtras::default()
+        });
+        mine.set_timer_extras(TimerExtras::default());
+        assert_eq!(mine.persistent_keepalive(), None);
+    }
+
+    /// Unset AWG ranges change nothing: the mapped params are the defaults and the
+    /// derived thresholds are the WireGuard constants.
+    #[test]
+    fn unset_ranges_equal_upstream_defaults() {
+        let unset = TimingRanges::default();
+        assert_eq!(timer_params_from(&unset), TimerParams::default());
+        assert_eq!(timer_extras_from(&unset), TimerExtras::default());
+
+        let (mut mine, _theirs) = two_tuns();
+        mine.set_timer_extras(timer_extras_from(&unset));
+        mine.format_handshake_initiation(false).expect("init");
+        assert_eq!(mine.timers.reject_after_time(), REJECT_AFTER_TIME);
+        assert_eq!(mine.timers.rekey_attempt_time(), REKEY_ATTEMPT_TIME);
+        assert_eq!(
+            mine.timers.rekey_after_receive(),
+            REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT
+        );
+        assert_eq!(mine.timers.persistent_keepalive, None);
     }
 }

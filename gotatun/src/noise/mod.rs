@@ -36,6 +36,8 @@ use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::timers::{TimerName, Timers};
 
 pub use crate::noise::timers::TimerParams;
+#[cfg(feature = "amnezia")]
+pub(crate) use crate::noise::timers::{MAX_JITTER, TimerExtras};
 use crate::packet::{Packet, WgCookieReply, WgData, WgHandshakeInit, WgHandshakeResp, WgKind};
 use crate::tun::MtuWatcher;
 use gotatun_crypto::x25519;
