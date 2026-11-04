@@ -35,13 +35,15 @@ pub(super) struct DeviceAmnezia {
 }
 
 impl DeviceAmnezia {
-    /// Validate `cfg` and build the device state for it. A config that is
-    /// plain WireGuard (or `None`) yields `None`, so the device keeps the
+    /// Validate `cfg` and build the device state for it. Zero values are read
+    /// as the UAPI reads them ([`AmneziaConfig::normalized`]). A config that
+    /// is plain WireGuard (or `None`) yields `None`, so the device keeps the
     /// unchanged upstream paths.
     pub(super) fn from_config(
         cfg: Option<AmneziaConfig>,
     ) -> Result<Option<Arc<Self>>, ConfigError> {
         let Some(cfg) = cfg else { return Ok(None) };
+        let cfg = cfg.normalized();
         cfg.validate()?;
         if cfg.is_plain_wireguard() {
             return Ok(None);
@@ -377,5 +379,57 @@ impl<U: UdpSend> UdpSend for SealingUdpSend<U> {
 
     fn max_number_of_packets_to_send(&self) -> usize {
         self.inner.max_number_of_packets_to_send()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::DeviceAmnezia;
+    use crate::amnezia::timers::{timer_extras_from, timer_params_from};
+    use crate::amnezia::tunn_state::AmneziaTunnState;
+    use crate::amnezia::{AmneziaConfig, CpsChain, U32Range};
+    use crate::noise::TimerParams;
+
+    /// Every field the UAPI (and amneziawg-go) reads as "off" or "default"
+    /// when zero, set to zero through the Rust API.
+    fn with_zero_values(mut cfg: AmneziaConfig) -> AmneziaConfig {
+        let zero = Duration::ZERO..=Duration::ZERO;
+        cfg.header_protection_key = Some([0; 32]);
+        cfg.content_padding = Some(U32Range { lo: 0, hi: 0 });
+        cfg.timings.rekey_after_time = Some(zero.clone());
+        cfg.timings.rekey_timeout = Some(zero.clone());
+        cfg.timings.reject_after_time = Some(zero.clone());
+        cfg.timings.keepalive_timeout = Some(zero);
+        cfg.timings.max_handshake_attempts = Some(0..=0);
+        cfg.init_packets.0[0] = Some(CpsChain::parse("").unwrap());
+        cfg
+    }
+
+    #[test]
+    fn zero_values_alone_are_plain_wireguard() {
+        let cfg = with_zero_values(AmneziaConfig::default());
+        assert!(DeviceAmnezia::from_config(Some(cfg)).unwrap().is_none());
+    }
+
+    #[test]
+    fn zero_values_behave_like_none() {
+        let mut base = AmneziaConfig::default();
+        base.padding.s4 = 8;
+        let amnezia = DeviceAmnezia::from_config(Some(with_zero_values(base.clone())))
+            .unwrap()
+            .unwrap();
+        assert_eq!(*amnezia.cfg, base);
+
+        // No header protection, no content padding (x16 and trailers kept),
+        // upstream timers.
+        assert!(amnezia.cfg.header_protection_key.is_none());
+        assert!(!AmneziaTunnState::new(amnezia.cfg.clone()).pads_content());
+        assert_eq!(
+            timer_params_from(&amnezia.cfg.timings),
+            TimerParams::default()
+        );
+        assert_eq!(timer_extras_from(&amnezia.cfg.timings), Default::default());
     }
 }
