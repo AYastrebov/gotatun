@@ -198,12 +198,9 @@ impl TimeStamper {
 
     /// Take time reading and generate a 12 byte timestamp
     pub fn stamp(&self) -> [u8; 12] {
-        #[cfg(not(feature = "amnezia"))]
-        const TAI64_BASE: u64 = (1u64 << 62) + 37;
-        // Kernel WireGuard and the Go implementations use Unix + 10. With +37
-        // a later kernel/Go handshake with the same key looks like a replay
-        // for 27 seconds.
-        #[cfg(feature = "amnezia")]
+        // Kernel WireGuard and the Go implementations use Unix + 10. With the
+        // +37 that BoringTun/GotaTun used before, a later kernel/Go handshake
+        // with the same key looked like a replay for 27 seconds.
         const TAI64_BASE: u64 = (1u64 << 62) + 10;
         let mut ext_stamp = [0u8; 12];
         let stamp = Instant::now().duration_since(self.instant_at_start) + self.duration_at_start;
