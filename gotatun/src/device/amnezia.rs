@@ -17,6 +17,7 @@ use crate::amnezia::timers::{timer_extras_from, timer_params_from};
 use crate::amnezia::tunn_state::{AmneziaTunnState, INITIAL_UDP_WINDOW};
 use crate::amnezia::{AmneziaConfig, ConfigError};
 use crate::noise::errors::WireGuardError;
+use crate::noise::index_table::IndexTable;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{TimerParams, Tunn, TunnResult};
 use crate::packet::{Packet, WgKind};
@@ -140,13 +141,21 @@ pub(super) fn obfs(amnezia: &Option<Arc<DeviceAmnezia>>) -> Option<&Obfuscator> 
 pub(super) struct ReceiveGate {
     rate_limiter: Arc<RateLimiter>,
     amnezia: AmneziaCell,
+    /// The device's session indices, to tell a transport packet for one of
+    /// our sessions from a handshake misread as transport (ruling R14).
+    index_table: IndexTable,
 }
 
 impl ReceiveGate {
-    pub(super) fn new(rate_limiter: Arc<RateLimiter>, amnezia: AmneziaCell) -> Self {
+    pub(super) fn new(
+        rate_limiter: Arc<RateLimiter>,
+        amnezia: AmneziaCell,
+        index_table: IndexTable,
+    ) -> Self {
         ReceiveGate {
             rate_limiter,
             amnezia,
+            index_table,
         }
     }
 
@@ -160,9 +169,11 @@ impl ReceiveGate {
         let Some(amnezia) = self.amnezia.load() else {
             return self.rate_limiter.verify_packet(src_addr, packet);
         };
+        // With trailers on, a "transport" packet whose receiver index is not
+        // one of ours is read again as a handshake (ruling R14).
         let (packet, kind) = amnezia
             .deobfs
-            .open(packet)
+            .open_with(packet, |idx| self.index_table.in_use(idx))
             .ok_or(TunnResult::Err(WireGuardError::InvalidPacket))?;
         self.rate_limiter
             .verify_classified(src_addr, packet, kind, amnezia.cfg.disable_cookies)
@@ -176,12 +187,18 @@ impl ReceiveGate {
 }
 
 impl<T: DeviceTransports> DeviceState<T> {
-    /// The shared cell the receive path and DAITA read the state from.
-    pub(super) async fn amnezia_cell(device: &Weak<RwLock<Self>>) -> AmneziaCell {
-        match device.upgrade() {
-            Some(device) => device.read().await.amnezia.clone(),
-            None => AmneziaCell::default(),
-        }
+    /// The receive gate for `handle_incoming`, reading the shared cell.
+    pub(super) async fn amnezia_receive_gate(
+        device: &Weak<RwLock<Self>>,
+        rate_limiter: Arc<RateLimiter>,
+    ) -> Option<ReceiveGate> {
+        let device = device.upgrade()?;
+        let device = device.read().await;
+        Some(ReceiveGate::new(
+            rate_limiter,
+            device.amnezia.clone(),
+            device.index_table.clone(),
+        ))
     }
 
     /// The current state, for send sites that hold the device lock.

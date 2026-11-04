@@ -111,6 +111,16 @@ fn sent_to(eve: &mock::MockEavesdropper, dst: IpAddr) -> impl Stream<Item = Pack
         .map(udp_payload)
 }
 
+/// How a receiver reads `datagram` when it is a handshake-type message: as
+/// classified, or (ruling R14) read again when it was misread as transport.
+fn handshake_kind(deobfs: &Deobfuscator, datagram: &[u8]) -> Option<WgPacketType> {
+    let c = deobfs.classify(datagram)?;
+    if c.kind == WgPacketType::Data {
+        return deobfs.reclassify_handshake(datagram, &c).map(|h| h.kind);
+    }
+    Some(c.kind)
+}
+
 /// Collect a stream for `period`.
 async fn collect_for<S: Stream<Item = Packet>>(stream: S, period: Duration) -> Vec<Packet> {
     let mut stream = std::pin::pin!(stream);
@@ -135,8 +145,11 @@ async fn drain<S: Stream<Item = Packet>>(stream: S, idle: Duration) -> Vec<Packe
 async fn ping(from: &MockDevice, to: &mut MockDevice, payload: &[u8]) {
     let packet = mock::packet(payload);
     from.app_tx.send(packet.clone()).await;
-    // With AWG 3.1 trailers a handshake is misread as transport about 1% of
-    // the time (|H4| / 2^32) and only a retry recovers, so the clock must run.
+    // Under `mock_instant` retries only fire if the test advances the clock.
+    // One is still sometimes needed: with AWG 3.1 trailers a handshake
+    // response is read as an initiation |H1| / 2^32 of the time (about 1%
+    // here), fails MAC1 and is dropped; ruling R14 only recovers handshakes
+    // misread as transport.
     let got = with_running_clock(timeout(Duration::from_secs(10), to.app_rx.recv()))
         .await
         .expect("packet should be delivered");
@@ -354,7 +367,7 @@ async fn pre_handshake_order_on_force_handshake() {
         );
         let deobfs = Deobfuscator::new(Arc::new(cfg));
         assert_eq!(
-            deobfs.classify(init).map(|c| c.kind),
+            handshake_kind(&deobfs, init),
             Some(WgPacketType::HandshakeInit),
             "{bob_ip}: the initiation follows the junk"
         );
@@ -429,7 +442,7 @@ async fn cookie_under_load_has_trailer_and_handshake_completes() {
         );
         let cookies: Vec<_> = datagrams
             .iter()
-            .filter(|d| deobfs.classify(d).map(|c| c.kind) == Some(WgPacketType::CookieReply))
+            .filter(|d| handshake_kind(&deobfs, d) == Some(WgPacketType::CookieReply))
             .collect();
         assert!(!cookies.is_empty(), "bob must answer with a cookie reply");
         for c in &cookies {
@@ -477,7 +490,7 @@ async fn uapi_set_amnezia_mid_traffic_rehandshakes() {
         assert!(
             datagrams
                 .iter()
-                .any(|d| deobfs.classify(d).map(|c| c.kind) == Some(WgPacketType::HandshakeInit)),
+                .any(|d| handshake_kind(&deobfs, d) == Some(WgPacketType::HandshakeInit)),
             "a new initiation under the new config"
         );
     }
@@ -710,7 +723,7 @@ async fn set_amnezia_mid_traffic_keeps_sockets() {
         after
             .into_iter()
             .map(|p| p.into_payload().into_payload())
-            .any(|d| deobfs.classify(&d).map(|c| c.kind) == Some(WgPacketType::HandshakeInit)),
+            .any(|d| handshake_kind(&deobfs, &d) == Some(WgPacketType::HandshakeInit)),
         "re-handshake under the new config"
     );
 }
@@ -774,5 +787,55 @@ async fn daita_decoys_are_sealed() {
         peer_window(&bob).await >= decoy,
         "bob decrypted no decoy: window {}",
         peer_window(&bob).await
+    );
+}
+
+/// R14: with trailers on, a handshake misread as transport (its bytes at S4
+/// fall in H4) is recovered on receive, so every handshake completes on the
+/// first try. H4 here covers half of all u32 values, so about half of all
+/// trailered handshakes are misread first; a retry would take 5 s.
+#[tokio::test]
+#[test_log::test]
+async fn misread_handshakes_complete_without_retry() {
+    let mut cfg = awg31();
+    cfg.headers.transport = range(2_000_000_000, 4_200_000_000);
+    cfg.timings.rekey_timeout = secs(5, 6);
+    // Keep this test to the transport misreading: a trailered response can
+    // also be read as an init (|H1| / 2^32), which R14 does not cover. With
+    // S1 + 148 above the 500-byte window, no response is long enough for that.
+    cfg.padding.s1 = 360;
+    let deobfs = Deobfuscator::new(Arc::new(cfg.clone()));
+
+    let mut misread = 0;
+    for _ in 0..6 {
+        let (alice, _bob, eve) = awg_pair(cfg.clone()).await;
+        let bob_key = alice.device.peers().await[0].peer.public_key;
+        let wire = eve.udp().map(|udp| udp.into_payload());
+        let (datagrams, done) = tokio::join!(
+            drain(wire, Duration::from_millis(300)),
+            timeout(
+                Duration::from_secs(2),
+                alice.device.force_handshake(&bob_key)
+            ),
+        );
+        done.expect("handshake completes without a retry")
+            .expect("peer exists");
+        misread += datagrams
+            .iter()
+            .filter_map(|d| deobfs.classify(d).map(|c| (d, c)))
+            .filter(|(d, c)| {
+                c.kind == WgPacketType::Data
+                    && deobfs.reclassify_handshake(d, c).is_some_and(|h| {
+                        matches!(
+                            h.kind,
+                            WgPacketType::HandshakeInit | WgPacketType::HandshakeResp
+                        )
+                    })
+            })
+            .count();
+    }
+    assert!(
+        misread > 0,
+        "no handshake was misread first; the test lost its point"
     );
 }
