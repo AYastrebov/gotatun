@@ -183,46 +183,39 @@ mod tests {
 
     use super::super::config::{HeaderRanges, Junk, Padding};
     use super::super::cps::CpsChain;
-    use super::super::junk::random_trailer_len;
-    use super::super::rng::{DetRng, FastRandom, RandomSource};
+    use super::super::rng::{DetRng, RandomSource};
+    use super::super::seal::Obfuscator;
     use super::*;
 
-    /// Test-only sender: H value, S-prefix, header protection, then an
-    /// optional trailer — awgtun's send order. Task 6 replaces this with
-    /// `Obfuscator::seal`.
-    pub(crate) fn seal_for_test(cfg: &AmneziaConfig, kind: WgPacketType, msg: &[u8]) -> Vec<u8> {
-        let mut rng = FastRandom;
-        let (range, prefix_len, protected_len) = match kind {
-            WgPacketType::HandshakeInit => (cfg.headers.init, cfg.padding.s1, PROTECTED_LEN_INIT),
-            WgPacketType::HandshakeResp => {
-                (cfg.headers.response, cfg.padding.s2, PROTECTED_LEN_RESPONSE)
-            }
-            WgPacketType::CookieReply => (cfg.headers.cookie, cfg.padding.s3, PROTECTED_LEN_COOKIE),
-            _ => (
-                cfg.headers.transport,
-                cfg.padding.s4,
-                PROTECTED_LEN_TRANSPORT,
-            ),
-        };
-        let mut message = msg.to_vec();
-        let h = rng.range_u32(range.start, range.end);
-        message[..4].copy_from_slice(&h.to_le_bytes());
+    /// Fixed `<t>` timestamp, so CPS-rendered bytes are deterministic.
+    const NOW: u32 = 0x6543_2100;
 
-        let mut out = vec![0u8; usize::from(prefix_len)];
-        rng.fill(&mut out);
-        if let Some(key) = cfg.header_protection_key {
-            HeaderProtection::new(key).apply(&out, &mut message, protected_len);
+    /// Send `msg` through [`Obfuscator::seal_with`] with a `window`-byte UDP
+    /// window and return the datagram carrying it. Init and response get an
+    /// H1/H2 value first, as the noise layer writes it before their MACs.
+    fn seal(
+        cfg: &AmneziaConfig,
+        kind: WgPacketType,
+        msg: &[u8],
+        mut window: usize,
+        rng: &mut DetRng,
+    ) -> Vec<u8> {
+        let mut msg = msg.to_vec();
+        if matches!(
+            kind,
+            WgPacketType::HandshakeInit | WgPacketType::HandshakeResp
+        ) {
+            let r = range_of(cfg, kind);
+            msg[..4].copy_from_slice(&rng.range_u32(r.start, r.end).to_le_bytes());
         }
-        out.extend_from_slice(&message);
-
-        if cfg.random_trailers && kind != WgPacketType::Data {
-            // Always append at least one byte so the trim is exercised.
-            let len = random_trailer_len(&mut rng, 500, out.len()).max(1);
-            let mut trailer = vec![0u8; len];
-            rng.fill(&mut trailer);
-            out.extend_from_slice(&trailer);
-        }
-        out
+        let packet = packet(&msg)
+            .try_into_wg_as(kind)
+            .expect("well-formed message");
+        let mut out = Vec::new();
+        Obfuscator::new(Arc::new(cfg.clone()))
+            .seal_with(packet, &mut window, &mut out, rng, NOW)
+            .expect("fits in a datagram");
+        out.pop().expect("message datagram").to_vec()
     }
 
     /// Synthetic AWG 3.x parameters with the real shape: S2 > 64, H ranges
@@ -323,9 +316,10 @@ mod tests {
     #[test]
     fn open_strips_prefix_each_kind() {
         let cfg = awg_cfg(false, false);
+        let mut rng = DetRng::new(10);
         for (kind, len) in kinds() {
             let msg = wg_message(kind, len);
-            let datagram = seal_for_test(&cfg, kind, &msg);
+            let datagram = seal(&cfg, kind, &msg, 500, &mut rng);
             assert_eq!(datagram.len(), len + prefix_of(&cfg, kind));
             assert_opened(&cfg, kind, &msg, &datagram);
         }
@@ -343,9 +337,10 @@ mod tests {
     #[test]
     fn open_unprotects_header() {
         let cfg = awg_cfg(true, false);
+        let mut rng = DetRng::new(11);
         for (kind, len) in kinds() {
             let msg = wg_message(kind, len);
-            let datagram = seal_for_test(&cfg, kind, &msg);
+            let datagram = seal(&cfg, kind, &msg, 500, &mut rng);
             let p = prefix_of(&cfg, kind);
             assert_ne!(
                 &datagram[p + 4..p + 16],
@@ -358,19 +353,23 @@ mod tests {
 
     #[test]
     fn open_trims_trailer_before_size_check() {
+        let mut rng = DetRng::new(12);
         for hp in [false, true] {
             let cfg = awg_cfg(hp, true);
             for (kind, len) in kinds() {
                 let msg = wg_message(kind, len);
-                let datagram = seal_for_test(&cfg, kind, &msg);
+                let base = len + prefix_of(&cfg, kind);
+                let datagram = seal(&cfg, kind, &msg, 500, &mut rng);
                 if kind != WgPacketType::Data {
-                    assert!(
-                        datagram.len() > len + prefix_of(&cfg, kind),
-                        "trailer present"
-                    );
+                    assert!(datagram.len() > base, "{kind:?}: trailer present");
                 }
                 // The fixed-size handshake messages come back at exactly
                 // their WireGuard size, so `==` parsers downstream accept them.
+                assert_opened(&cfg, kind, &msg, &datagram);
+
+                // A window the message already fills: zero-length trailer.
+                let datagram = seal(&cfg, kind, &msg, base, &mut rng);
+                assert_eq!(datagram.len(), base, "{kind:?}: no trailer");
                 assert_opened(&cfg, kind, &msg, &datagram);
             }
         }
@@ -404,6 +403,7 @@ mod tests {
                 ..AmneziaConfig::default()
             };
             let deob = Deobfuscator::new(Arc::new(cfg.clone()));
+            let mut rng = DetRng::new(13);
             // Ciphertext-shaped bytes from a cheap LCG (a CSPRNG is slow in
             // debug builds and buys nothing here).
             let mut x: u64 = 1;
@@ -416,7 +416,7 @@ mod tests {
                             .wrapping_add(1_442_695_040_888_963_407);
                         *b = (x >> 33) as u8;
                     }
-                    let datagram = seal_for_test(&cfg, WgPacketType::Data, &msg);
+                    let datagram = seal(&cfg, WgPacketType::Data, &msg, 500, &mut rng);
                     !matches!(
                         deob.classify(&datagram),
                         Some(c) if c.kind == WgPacketType::Data && c.prefix == 23
@@ -453,7 +453,9 @@ mod tests {
                     "<b 0x01000000>",
                 ] {
                     let mut ipkt = Vec::new();
-                    CpsChain::parse(chain).unwrap().render(&mut rng, &mut ipkt);
+                    CpsChain::parse(chain)
+                        .unwrap()
+                        .render_at(&mut rng, NOW, &mut ipkt);
                     assert!(
                         deob.open(packet(&ipkt)).is_none(),
                         "I-packet {chain} accepted"
@@ -486,7 +488,7 @@ mod tests {
         let mut msg = vec![0u8; WgData::OVERHEAD + 64];
         msg[4..8].copy_from_slice(&0xdead_beefu32.to_le_bytes());
         msg[8..16].copy_from_slice(&0x0123_4567_89ab_cdefu64.to_le_bytes());
-        let datagram = seal_for_test(&cfg, WgPacketType::Data, &msg);
+        let datagram = seal(&cfg, WgPacketType::Data, &msg, 500, &mut DetRng::new(14));
 
         let c = deob.classify(&datagram).expect("transport classifies");
         assert_eq!(c.kind, WgPacketType::Data);

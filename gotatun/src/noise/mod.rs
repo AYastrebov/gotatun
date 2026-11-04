@@ -90,7 +90,6 @@ pub struct Tunn<R: RngCore + Send = StdRng> {
     jitter_rng: R,
     /// AmneziaWG per-tunnel state; `None` is plain WireGuard.
     #[cfg(feature = "amnezia")]
-    #[allow(dead_code)] // Read by content padding and the device send path.
     amnezia: Option<AmneziaTunnState>,
 }
 
@@ -549,6 +548,13 @@ impl<R: RngCore + Send> Tunn<R> {
         self.handshake
             .set_wire_types(state.as_ref().map(AmneziaTunnState::wire_types));
         self.amnezia = state;
+    }
+
+    /// This tunnel's AmneziaWG UDP window (`None` for plain WireGuard), the
+    /// single source of truth the send boundary sizes trailers against.
+    #[allow(dead_code)] // Called by the device send path.
+    pub(crate) fn amnezia_udp_window_mut(&mut self) -> Option<&mut usize> {
+        self.amnezia.as_mut().map(AmneziaTunnState::udp_window_mut)
     }
 }
 
@@ -1293,7 +1299,8 @@ mod tests {
     mod amnezia {
         use super::*;
         use crate::amnezia::classify::Deobfuscator;
-        use crate::amnezia::rng::{FastRandom, RandomSource};
+        use crate::amnezia::rng::DetRng;
+        use crate::amnezia::seal::Obfuscator;
         use crate::amnezia::{AmneziaConfig, HeaderRange, HeaderRanges, Padding};
 
         /// Synthetic AWG parameters with the real shape: S2 > 64, H ranges
@@ -1344,13 +1351,33 @@ mod tests {
             u32::from_le_bytes(bytes[..4].try_into().unwrap())
         }
 
-        /// Test-only sender: prepend a random S-prefix (Task 6 adds the real
-        /// `seal`).
-        fn with_prefix(prefix: u16, msg: &[u8]) -> Packet {
-            let mut out = vec![0u8; usize::from(prefix)];
-            FastRandom.fill(&mut out);
-            out.extend_from_slice(msg);
-            Packet::from_bytes(BytesMut::from(&out[..]))
+        /// The AmneziaWG send path: obfuscate `packet` and return the
+        /// datagram carrying the message itself.
+        ///
+        /// Prefixes come from a deterministic RNG: with trailers on, a
+        /// handshake whose prefix happens to decode as H4 would be taken for
+        /// transport, and a test must not depend on that 1-in-4000 draw.
+        fn seal(cfg: &Arc<AmneziaConfig>, window: &mut usize, packet: impl Into<WgKind>) -> Packet {
+            let mut out = seal_all(cfg, window, packet);
+            out.pop().expect("message datagram")
+        }
+
+        /// Every datagram `seal` emits for `packet` (I-packets, junk, message).
+        fn seal_all(
+            cfg: &Arc<AmneziaConfig>,
+            window: &mut usize,
+            packet: impl Into<WgKind>,
+        ) -> Vec<Packet> {
+            thread_local!(static SEED: std::cell::Cell<u8> = const { std::cell::Cell::new(0) });
+            let seed = SEED.with(|s| {
+                s.set(s.get().wrapping_add(1));
+                s.get()
+            });
+            let mut out = Vec::new();
+            Obfuscator::new(cfg.clone())
+                .seal_with(packet.into(), window, &mut out, &mut DetRng::new(seed), 0)
+                .expect("fits in a datagram");
+            out
         }
 
         /// The AmneziaWG receive path: classify and open, verify the MACs
@@ -1375,7 +1402,7 @@ mod tests {
             let (mut a, mut b) = awg_tuns(&cfg);
 
             let init = create_handshake_init(&mut a);
-            let datagram = with_prefix(cfg.padding.s1, init.as_bytes());
+            let datagram = seal(&cfg, &mut 500, init);
             let result = deliver(&cfg, &mut b, datagram);
             let TunnResult::WriteToNetwork(WgKind::HandshakeResp(resp)) = result else {
                 panic!("expected a handshake response, got {result:?}");
@@ -1388,7 +1415,7 @@ mod tests {
                 "response type {h} outside H2"
             );
 
-            let datagram = with_prefix(cfg.padding.s2, resp.as_bytes());
+            let datagram = seal(&cfg, &mut 500, resp);
             let result = deliver(&cfg, &mut a, datagram);
             let TunnResult::WriteToNetwork(WgKind::Data(keepalive)) = result else {
                 panic!("expected a keepalive after the handshake, got {result:?}");
@@ -1421,6 +1448,65 @@ mod tests {
             );
         }
 
+        /// Full AWG 3.1 framing (header protection, trailers, S4 on the
+        /// keepalive) through real tunnels, each side sizing trailers
+        /// against its own UDP window.
+        #[test]
+        fn awg3_handshake_and_data_through_seal() {
+            let mut c = (*awg_cfg(23, 87)).clone();
+            c.header_protection_key = Some([0x42; 32]);
+            c.random_trailers = true;
+            c.junk = crate::amnezia::Junk {
+                count: 2,
+                min: 30,
+                max: 60,
+            };
+            let cfg = Arc::new(c);
+            let (mut a, mut b) = awg_tuns(&cfg);
+
+            let init = create_handshake_init(&mut a);
+            let window = a.amnezia_udp_window_mut().expect("amnezia on");
+            assert_eq!(*window, 500);
+            let mut out = seal_all(&cfg, window, init);
+            assert_eq!(out.len(), 3, "junk, junk, init");
+            let datagram = out.pop().unwrap();
+            assert!(datagram.len() >= 23 + WgHandshakeInit::LEN);
+            for junk in out {
+                assert!(Deobfuscator::new(cfg.clone()).open(junk).is_none());
+            }
+            let result = deliver(&cfg, &mut b, datagram);
+            let TunnResult::WriteToNetwork(resp) = result else {
+                panic!("expected a handshake response, got {result:?}");
+            };
+
+            let window = b.amnezia_udp_window_mut().unwrap();
+            let datagram = seal(&cfg, window, resp);
+            let result = deliver(&cfg, &mut a, datagram);
+            let TunnResult::WriteToNetwork(keepalive) = result else {
+                panic!("expected a keepalive after the handshake, got {result:?}");
+            };
+            let window = a.amnezia_udp_window_mut().unwrap();
+            let datagram = seal(&cfg, window, keepalive);
+            assert_eq!(
+                datagram.len(),
+                19 + WgData::OVERHEAD,
+                "S4-prefixed keepalive"
+            );
+            let result = deliver(&cfg, &mut b, datagram);
+            assert!(matches!(result, TunnResult::WriteToTunnel(p) if p.is_empty()));
+
+            let sent = create_ipv4_udp_packet();
+            let data = a
+                .handle_outgoing_packet(sent.clone().into_bytes(), None)
+                .expect("session should encrypt the packet");
+            let window = a.amnezia_udp_window_mut().unwrap();
+            let datagram = seal(&cfg, window, data);
+            let TunnResult::WriteToTunnel(received) = deliver(&cfg, &mut b, datagram) else {
+                panic!("session should decrypt the packet");
+            };
+            assert_eq!(sent.as_bytes(), received.as_bytes());
+        }
+
         /// Negative control: a plain WireGuard receiver must not take an
         /// AmneziaWG initiation for a WireGuard one.
         #[test]
@@ -1434,7 +1520,7 @@ mod tests {
                     let init = a
                         .format_handshake_initiation(true)
                         .expect("expected handshake init");
-                    let datagram = with_prefix(cfg.padding.s1, init.as_bytes());
+                    let datagram = seal(&cfg, &mut 500, init);
 
                     // The type field holds H1 rather than 1, and S1 shifts
                     // the message; the plain classifier recognises neither.

@@ -260,7 +260,6 @@ impl Default for WgDataHeader {
 }
 
 #[cfg(feature = "amnezia")]
-#[allow(dead_code)] // Consumed by later AmneziaWG tasks; only tests use it yet.
 impl WgDataHeader {
     /// Overwrite the 4-byte little-endian type field (`packet_type` plus the
     /// reserved bytes) with `v`. AmneziaWG carries its H values here.
@@ -538,7 +537,6 @@ impl Default for WgCookieReply {
 }
 
 #[cfg(feature = "amnezia")]
-#[allow(dead_code)] // Consumed by later AmneziaWG tasks; only tests use it yet.
 impl WgCookieReply {
     /// Overwrite the 4-byte little-endian type field (`packet_type` plus the
     /// reserved bytes) with `v`. AmneziaWG carries its H values here.

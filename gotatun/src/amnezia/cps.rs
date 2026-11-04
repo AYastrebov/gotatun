@@ -66,18 +66,18 @@ impl CpsChain {
         self.tags.is_empty()
     }
 
-    /// Append the chain's bytes to `out`.
+    /// Append the chain's bytes to `out`, stamping `<t>` with the current time.
+    #[cfg(test)]
     pub(crate) fn render(&self, rng: &mut dyn RandomSource, out: &mut Vec<u8>) {
+        self.render_at(rng, unix_now_secs(), out);
+    }
+
+    /// Append the chain's bytes to `out`, stamping `<t>` with `unix_secs`.
+    pub(crate) fn render_at(&self, rng: &mut dyn RandomSource, unix_secs: u32, out: &mut Vec<u8>) {
         for tag in &self.tags {
             match tag {
                 CpsTag::Bytes(b) => out.extend_from_slice(b),
-                CpsTag::Timestamp => {
-                    let ts = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as u32;
-                    out.extend_from_slice(&ts.to_be_bytes());
-                }
+                CpsTag::Timestamp => out.extend_from_slice(&unix_secs.to_be_bytes()),
                 CpsTag::RandomBytes(n) => {
                     let start = out.len();
                     out.resize(start + n, 0);
@@ -98,6 +98,14 @@ impl CpsChain {
             }
         }
     }
+}
+
+/// Seconds since the Unix epoch, truncated to 32 bits as `<t>` writes them.
+pub(crate) fn unix_now_secs() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as u32
 }
 
 fn parse_tag(tag: &str) -> Result<CpsTag, ConfigError> {
