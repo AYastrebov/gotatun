@@ -4,13 +4,17 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Buf;
 #[cfg(feature = "mock_instant")]
 use mock_instant::thread_local::Instant;
 use parking_lot::Mutex;
+#[cfg(not(target_has_atomic = "64"))]
+use portable_atomic::AtomicU64;
 
 #[cfg(not(feature = "mock_instant"))]
 use crate::sleepyinstant::Instant;
