@@ -11,9 +11,7 @@ This document covers the two obfuscation features added on top of GotaTun, both 
   needs bytes 1-3 of every WireGuard message to be zero, which AmneziaWG headers break. The device
   refuses to build with both.
 
-With both features off, upstream code paths compile unchanged, with one deliberate exception that
-is a plain-WireGuard bug fix: the handshake timestamp epoch (see
-[Fixes made while porting](#fixes-made-while-porting)). With `amnezia` compiled in but no config
+With both features off, upstream code paths compile unchanged. With `amnezia` compiled in but no config
 set, the device is plain WireGuard and skips all Amnezia work on the hot path.
 
 ## AmneziaWG
@@ -190,11 +188,8 @@ Where Go behaviour was copied even though it looks odd:
 ### Fixes made while porting
 
 * **Handshake TAI64N epoch.** GotaTun used `2^62 + 37`; the kernel and Go use `2^62 + 10`, so the
-  timestamp ran 27 s ahead. The fix is unconditional (it is a plain-WireGuard interop bug, and
-  gating it on a feature would make two builds of this crate with the same key stamp 27 s
-  apart). After an upgrade, a peer that has already seen the old, 27 s-ahead stamps from this
-  key rejects the new initiations as replays until the clock catches up, for up to 27 s. The
-  fix is submitted upstream to Mullvad separately.
+  timestamp ran 27 s ahead. Found during this port and fixed upstream in GotaTun 0.10.3, for
+  every build.
 * **Mock UDP channel** (tests): the IPv6 flow label could overflow 20 bits (commit `daa7bf9`).
 * **awgtun** (the boringtun fork this port was checked against) had two bugs that are not carried
   over: on its device path, cookie replies lacked the 3.1 trailer (here every cookie reply is

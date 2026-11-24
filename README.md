@@ -114,8 +114,7 @@ Two optional features, both off by default in the library (the `gotatun` executa
   `PhobosHandle` and call `address_changed()`.
 
 With `amnezia` compiled in but unconfigured, the `Tunn` hot path measures the same as without it
-(`cargo bench -p gotatun --bench tunn_benches`). One change applies to plain WireGuard in every
-build: the handshake timestamp epoch now matches kernel WireGuard (upstream's ran 27 s ahead).
+(`cargo bench -p gotatun --bench tunn_benches`).
 See [docs/amnezia.md](docs/amnezia.md) for the wire format, config keys, MTU guidance,
 the differences from amneziawg-go, known limitations, and notes for rebasing on upstream.
 

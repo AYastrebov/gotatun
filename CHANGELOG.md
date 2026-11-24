@@ -47,10 +47,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logged at `warn` once instead of only at `trace`.
 
 ### Fixed
-- The handshake TAI64N timestamp uses the epoch of kernel WireGuard and wireguard-go
-  (`2^62 + 10`) instead of `2^62 + 37`, which ran 27 seconds ahead. This applies to every build.
-  After upgrading, a peer that saw the old stamps from the same key rejects initiations as
-  replays for up to 27 seconds.
 - A UAPI peer block that gives `persistent_keepalive_interval` both as a range and as a fixed
   value now takes the last one, in either order, as amneziawg-go does.
 - Changing a peer's keepalive range no longer resets a live handshake's give-up budget or a live
